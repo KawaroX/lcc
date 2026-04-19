@@ -200,3 +200,70 @@ def cache_segment(*, area_id: str, start_time: str, end_time: str, segment: str)
     cache[key] = segment
     data["segment_cache"] = cache
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def save_pomo_state(state: dict) -> None:
+    """
+    Save pomodoro daemon state to .lcc.json.
+    """
+    path = _config_path()
+    data = _load_file(path)
+    data["pomo_daemon"] = state
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_pomo_state() -> dict | None:
+    """
+    Load pomodoro daemon state from .lcc.json.
+    Returns None if no state exists.
+    """
+    data = _load_file(_config_path())
+    state = data.get("pomo_daemon")
+    if isinstance(state, dict):
+        return state
+    return None
+
+
+def clear_pomo_state() -> None:
+    """
+    Remove pomodoro daemon state from .lcc.json.
+    """
+    path = _config_path()
+    data = _load_file(path)
+    if "pomo_daemon" in data:
+        del data["pomo_daemon"]
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def is_pomo_running() -> bool:
+    """
+    Check if pomodoro daemon is running based on saved PID.
+    Returns True if PID exists and process is alive.
+    """
+    import os
+    import sys
+
+    state = load_pomo_state()
+    if not isinstance(state, dict):
+        return False
+
+    pid = state.get("pid")
+    if not isinstance(pid, int):
+        return False
+
+    try:
+        if sys.platform == "win32":
+            # Windows: try to open process
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        else:
+            # Unix: send signal 0
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError, AttributeError):
+        return False

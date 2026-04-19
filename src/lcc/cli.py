@@ -1195,6 +1195,183 @@ def _cmd_pomo(args: argparse.Namespace) -> int:
     return _cmd_pomo_start(args)
 
 
+def _cmd_pomo_start_daemon(args: argparse.Namespace) -> int:
+    """启动后台番茄钟守护进程。"""
+    from .pomo_utils import start_daemon
+    from .config import save_pomo_state, load_pomo_state, clear_pomo_state
+    import time
+    from datetime import datetime, timedelta
+
+    # 解析时长
+    total_sec = _parse_duration_to_seconds(args.duration)
+
+    # 处理 flash 参数
+    low: int | None = args.low
+    high: int | None = args.high
+    if hasattr(args, 'flash') and args.flash:
+        parts = str(args.flash).split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ConfigError(f"--flash 格式错误：{args.flash}（应为 LO:HI，例如 20:40）")
+        try:
+            low = int(parts[0])
+            high = int(parts[1])
+        except ValueError as e:
+            raise ConfigError(f"--flash 的值必须是整数：{args.flash}") from e
+
+    low = 20 if low is None else int(low)
+    high = 40 if high is None else int(high)
+    cycles = int(args.cycles) if hasattr(args, 'cycles') else 2
+    interval = float(args.interval) if hasattr(args, 'interval') else 0.0
+
+    # 获取当前设备信息（用于状态记录）
+    from .pomo_utils import get_current_brightness
+    try:
+        current_brightness, device_id, area_id = get_current_brightness(
+            timeout=args.timeout,
+            insecure=args.insecure,
+            use_proxy=args.proxy,
+            prefer_area_id=args.prefer_area_id,
+        )
+    except Exception as e:
+        raise ConfigError(f"无法获取当前设备信息: {e}")
+
+    # 启动守护进程
+    pid = start_daemon(
+        duration_seconds=total_sec,
+        low=low,
+        high=high,
+        cycles=cycles,
+        interval=interval,
+        timeout=args.timeout,
+        insecure=args.insecure,
+        use_proxy=args.proxy,
+        prefer_area_id=args.prefer_area_id,
+    )
+
+    # 保存状态
+    state = {
+        "pid": pid,
+        "started_at": datetime.now().isoformat(),
+        "duration_seconds": total_sec,
+        "end_at": (datetime.now() + timedelta(seconds=total_sec)).isoformat(),
+        "original_brightness": current_brightness,
+        "device_id": device_id,
+        "area_id": area_id,
+        "low": low,
+        "high": high,
+        "cycles": cycles,
+        "interval": interval,
+        "status": "running",
+    }
+    save_pomo_state(state)
+
+    print(f"✅ 番茄钟已启动（PID: {pid}）")
+    print(f"   时长: {total_sec // 60} 分 {total_sec % 60} 秒")
+    print(f"   结束时间: {state['end_at']}")
+    print(f"   原始亮度: {current_brightness}")
+    print(f"   闪烁: {low}↔{high} x{cycles}")
+    print("使用 'lcc pomo status' 查看状态，'lcc pomo stop' 提前停止")
+    return 0
+
+
+def _cmd_pomo_status(args: argparse.Namespace) -> int:
+    """查看后台番茄钟状态。"""
+    from .config import load_pomo_state, is_pomo_running
+    from .pomo_utils import calculate_remaining_seconds, format_remaining_time
+    import json
+
+    state = load_pomo_state()
+    if not state:
+        print("没有活跃的番茄钟")
+        return 0
+
+    print("番茄钟状态:")
+    print(f"   PID: {state.get('pid', 'N/A')}")
+    print(f"   开始时间: {state.get('started_at', 'N/A')}")
+    print(f"   时长: {state.get('duration_seconds', 0)} 秒")
+    print(f"   结束时间: {state.get('end_at', 'N/A')}")
+    print(f"   原始亮度: {state.get('original_brightness', 'N/A')}")
+    print(f"   设备: {state.get('device_id', 'N/A')} (区域: {state.get('area_id', 'N/A')})")
+    print(f"   闪烁设置: {state.get('low', 20)}↔{state.get('high', 40)} x{state.get('cycles', 2)}")
+    print(f"   状态: {state.get('status', 'unknown')}")
+
+    # 检查进程是否存活
+    if is_pomo_running():
+        remaining = calculate_remaining_seconds(state)
+        if remaining > 0:
+            print(f"   🟢 运行中，剩余: {format_remaining_time(remaining)}")
+        else:
+            print("   🟡 计时结束，可能正在闪烁或恢复")
+    else:
+        print("   🔴 进程未运行（可能已结束或崩溃）")
+        print("   使用 'lcc pomo stop' 清理状态")
+
+    return 0
+
+
+def _cmd_pomo_stop(args: argparse.Namespace) -> int:
+    """停止后台番茄钟。"""
+    from .config import load_pomo_state, clear_pomo_state, is_pomo_running
+    from .pomo_utils import stop_daemon
+
+    state = load_pomo_state()
+    if not state:
+        print("没有活跃的番茄钟")
+        return 0
+
+    pid = state.get('pid')
+    if not isinstance(pid, int):
+        print("状态中 PID 无效")
+        clear_pomo_state()
+        return 0
+
+    # 停止进程
+    if is_pomo_running():
+        print(f"正在停止进程 {pid}...")
+        if stop_daemon(pid):
+            print("✅ 已发送停止信号")
+        else:
+            print("⚠️  进程可能已结束")
+    else:
+        print("进程未在运行")
+
+    # 清理状态
+    clear_pomo_state()
+    print("状态已清理")
+    return 0
+
+
+def _cmd_pomo_flash_only(args: argparse.Namespace) -> int:
+    """立即闪烁灯光（不计时）。"""
+    # 复用现有的 _cmd_pomo_flash 但需要适应新的参数结构
+    low: int | None = args.low
+    high: int | None = args.high
+    if hasattr(args, 'flash') and args.flash:
+        parts = str(args.flash).split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ConfigError(f"--flash 格式错误：{args.flash}（应为 LO:HI，例如 20:40）")
+        try:
+            low = int(parts[0])
+            high = int(parts[1])
+        except ValueError as e:
+            raise ConfigError(f"--flash 的值必须是整数：{args.flash}") from e
+
+    args.low = 20 if low is None else int(low)
+    args.high = 40 if high is None else int(high)
+    args.cycles = int(args.cycles) if hasattr(args, 'cycles') else 2
+    args.interval = float(args.interval) if hasattr(args, 'interval') else 0.0
+
+    return _cmd_pomo_flash(args)
+
+
+def _cmd_pomo_daemon(args: argparse.Namespace) -> int:
+    """内部命令：运行番茄钟守护进程。"""
+    from .pomo_daemon import main as daemon_main
+    return daemon_main(args)
+
+
+
+
 def _cmd_seats(args: argparse.Namespace) -> int:
     # Default to free-only; --all shows everything.
     args.status = [] if getattr(args, "show_all", False) else ["1"]
@@ -1299,15 +1476,70 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # === pomo ===
-    p_pomo = sub.add_parser("pomo", help="番茄钟（到点闪灯；默认 25m，20↔40）")
-    p_pomo.add_argument("duration", nargs="?", default="25m", help="时长：25 / 25m / 1h（默认 25m）")
-    p_pomo.add_argument("low", nargs="?", type=int, default=None, help="低亮度（默认 20）")
-    p_pomo.add_argument("high", nargs="?", type=int, default=None, help="高亮度（默认 40）")
-    p_pomo.add_argument("--flash", help="LO:HI，如 20:40（等价于两个位置参数）")
-    p_pomo.add_argument("--cycles", type=int, default=2, help="到达高亮度的次数（默认 2）")
-    p_pomo.add_argument("--interval", type=float, default=0.0, help=argparse.SUPPRESS)
-    p_pomo.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
-    p_pomo.set_defaults(func=_cmd_pomo, insecure=False, prefer_area_id=None)
+    p_pomo = sub.add_parser("pomo", help="番茄钟命令组")
+    sub_pomo = p_pomo.add_subparsers(dest="pomo_cmd", title="子命令", required=True)
+
+    # pomo frontend [duration] [low] [high] (前台模式)
+    p_pomo_frontend = sub_pomo.add_parser("frontend", help="前台运行番茄钟（默认 25m，20↔40）")
+    p_pomo_frontend.add_argument("duration", nargs="?", default="25m", help="时长：25 / 25m / 1h（默认 25m）")
+    p_pomo_frontend.add_argument("low", nargs="?", type=int, default=None, help="低亮度（默认 20）")
+    p_pomo_frontend.add_argument("high", nargs="?", type=int, default=None, help="高亮度（默认 40）")
+    p_pomo_frontend.add_argument("--flash", help="LO:HI，如 20:40（等价于两个位置参数）")
+    p_pomo_frontend.add_argument("--cycles", type=int, default=2, help="到达高亮度的次数（默认 2）")
+    p_pomo_frontend.add_argument("--interval", type=float, default=0.0, help=argparse.SUPPRESS)
+    p_pomo_frontend.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_pomo_frontend.add_argument("--insecure", action="store_true", help="跳过 SSL 证书验证")
+    p_pomo_frontend.add_argument("--proxy", action="store_true", help="使用系统代理")
+    p_pomo_frontend.add_argument("--prefer-area-id", type=str, default=None, help=argparse.SUPPRESS)
+    p_pomo_frontend.set_defaults(func=_cmd_pomo, insecure=False, prefer_area_id=None)
+
+    # pomo start [duration] [low] [high] [--flash=LO:HI] [--cycles=CYCLES]
+    p_pomo_start = sub_pomo.add_parser("start", help="后台启动番茄钟守护进程")
+    p_pomo_start.add_argument("duration", nargs="?", default="25m", help="时长：25 / 25m / 1h（默认 25m）")
+    p_pomo_start.add_argument("low", nargs="?", type=int, default=None, help="闪烁低亮度（默认 20）")
+    p_pomo_start.add_argument("high", nargs="?", type=int, default=None, help="闪烁高亮度（默认 40）")
+    p_pomo_start.add_argument("--flash", help="LO:HI，如 20:40（等价于两个位置参数）")
+    p_pomo_start.add_argument("--cycles", type=int, default=2, help="闪烁次数（默认 2）")
+    p_pomo_start.add_argument("--interval", type=float, default=0.0, help=argparse.SUPPRESS)
+    p_pomo_start.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_pomo_start.add_argument("--insecure", action="store_true", help="跳过 SSL 证书验证")
+    p_pomo_start.add_argument("--proxy", action="store_true", help="使用系统代理")
+    p_pomo_start.add_argument("--prefer-area-id", type=str, default=None, help=argparse.SUPPRESS)
+    p_pomo_start.set_defaults(func=_cmd_pomo_start_daemon, insecure=False, prefer_area_id=None)
+
+    # pomo status
+    p_pomo_status = sub_pomo.add_parser("status", help="查看后台番茄钟状态")
+    p_pomo_status.set_defaults(func=_cmd_pomo_status, insecure=False)
+
+    # pomo stop
+    p_pomo_stop = sub_pomo.add_parser("stop", help="停止后台番茄钟")
+    p_pomo_stop.set_defaults(func=_cmd_pomo_stop, insecure=False)
+
+    # pomo flash [--low=LOW] [--high=HIGH] [--cycles=CYCLES]
+    p_pomo_flash = sub_pomo.add_parser("flash", help="立即闪烁灯光（不启动计时器）")
+    p_pomo_flash.add_argument("--low", type=int, default=20, help="低亮度（默认 20）")
+    p_pomo_flash.add_argument("--high", type=int, default=40, help="高亮度（默认 40）")
+    p_pomo_flash.add_argument("--cycles", type=int, default=2, help="闪烁次数（默认 2）")
+    p_pomo_flash.add_argument("--interval", type=float, default=0.0, help=argparse.SUPPRESS)
+    p_pomo_flash.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_pomo_flash.add_argument("--insecure", action="store_true", help="跳过 SSL 证书验证")
+    p_pomo_flash.add_argument("--proxy", action="store_true", help="使用系统代理")
+    p_pomo_flash.add_argument("--prefer-area-id", type=str, default=None, help=argparse.SUPPRESS)
+    p_pomo_flash.set_defaults(func=_cmd_pomo_flash_only, insecure=False, prefer_area_id=None)
+
+    # === hidden: pomo-daemon (internal use only) ===
+    p_pomo_daemon = sub.add_parser("pomo-daemon", add_help=False)
+    p_pomo_daemon.add_argument("--duration", type=float, required=True, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--low", type=int, default=20, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--high", type=int, default=40, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--cycles", type=int, default=2, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--interval", type=float, default=0.0, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--prefer-area-id", type=str, default=None, help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--insecure", action="store_true", help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--proxy", action="store_true", help=argparse.SUPPRESS)
+    p_pomo_daemon.add_argument("--record-brightness", action="store_true", help=argparse.SUPPRESS)
+    p_pomo_daemon.set_defaults(func=_cmd_pomo_daemon, insecure=False)
 
     # === config ===
     p_config = sub.add_parser("config", help="写入默认值到 .lcc.json（如默认区域）")
