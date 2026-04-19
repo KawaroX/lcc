@@ -32,12 +32,56 @@ def _effective_verify_ssl(auth, args: argparse.Namespace) -> bool:
     return bool(getattr(auth, "verify_ssl", True))
 
 def _effective_use_proxy(args: argparse.Namespace) -> bool:
-    if getattr(args, "no_proxy", False):
-        return False
-    v = (os.environ.get("LCC_NO_PROXY") or "").strip().lower()
+    # Default: no proxy (campus network). Opt-in via --proxy or LCC_PROXY=1.
+    if getattr(args, "proxy", False):
+        return True
+    v = (os.environ.get("LCC_PROXY") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
-        return False
-    return True
+        return True
+    return False
+
+
+def _parse_light_arg(v: str) -> int:
+    """on → 20, off → 0, otherwise int in [0, 100]."""
+    s = str(v or "").strip().lower()
+    if s == "on":
+        return 20
+    if s == "off":
+        return 0
+    try:
+        n = int(s)
+    except ValueError as e:
+        raise ConfigError(f"无法识别的亮度：{v}（允许 on / off / 0-100）") from e
+    if not 0 <= n <= 100:
+        raise ConfigError(f"亮度超出范围：{n}（应在 0-100）")
+    return n
+
+
+def _parse_duration_to_seconds(v: str) -> float:
+    """
+    '25' → 25 min, '25m' → 25 min, '1h' → 60 min.
+    Bare s/d/other suffixes are rejected (s too short, d too long for one session).
+    """
+    s = str(v or "").strip().lower()
+    if not s:
+        raise ConfigError("时长不能为空")
+    if s.endswith("h"):
+        try:
+            return float(s[:-1]) * 3600.0
+        except ValueError as e:
+            raise ConfigError(f"无法识别的时长：{v}") from e
+    if s.endswith("m"):
+        try:
+            return float(s[:-1]) * 60.0
+        except ValueError as e:
+            raise ConfigError(f"无法识别的时长：{v}") from e
+    # Any other trailing letter is rejected.
+    if s[-1].isalpha():
+        raise ConfigError(f"时长单位只支持 m 或 h：{v}")
+    try:
+        return float(s) * 60.0  # plain number = minutes
+    except ValueError as e:
+        raise ConfigError(f"无法识别的时长：{v}") from e
 
 def _fetch_subscribe(args: argparse.Namespace, auth, *, timeout: float, verify_ssl: bool, insecure: bool) -> object:
     return post_json_authed(
@@ -540,32 +584,6 @@ def _cmd_light_set(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_light_list(args: argparse.Namespace) -> int:
-    auth = load_auth_loose()
-    verify_ssl = _effective_verify_ssl(auth, args)
-    if args.data:
-        try:
-            payload = json.loads(args.data)
-        except json.JSONDecodeError as e:
-            raise ConfigError(f"--data 不是合法 JSON: {e}") from e
-    elif args.area_id:
-        resolved = _resolve_area_id_maybe(args.area_id, args, auth=auth)
-        payload = {"area_id": str(resolved)}
-    else:
-        payload = {}
-
-    data = post_json_authed(
-        path=args.path,
-        json_body=payload,
-        timeout_sec=float(args.timeout),
-        insecure=bool(args.insecure),
-        verify_ssl=verify_ssl,
-        use_proxy=_effective_use_proxy(args),
-    )
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-    return 0
-
-
 def _resolve_my_light_device_ids(
     args: argparse.Namespace,
     *,
@@ -692,38 +710,28 @@ def _cmd_pomo_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_me_subscribe(args: argparse.Namespace) -> int:
+def _cmd_me(args: argparse.Namespace) -> int:
     auth = load_auth_loose()
     verify_ssl = _effective_verify_ssl(auth, args)
     data = _fetch_subscribe(args, auth, timeout=float(args.timeout), verify_ssl=verify_ssl, insecure=bool(args.insecure))
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-    return 0
 
-
-def _cmd_me_current(args: argparse.Namespace) -> int:
-    auth = load_auth_loose()
-    verify_ssl = _effective_verify_ssl(auth, args)
-    data = _fetch_subscribe(args, auth, timeout=float(args.timeout), verify_ssl=verify_ssl, insecure=bool(args.insecure))
+    if getattr(args, "raw", False):
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
 
     try:
-        item = _pick_my_active_item(data, prefer_area_id=args.prefer_area_id)
+        item = _pick_my_active_item(data, prefer_area_id=getattr(args, "prefer_area_id", None))
     except ConfigError:
         print(json.dumps({"active": False}, ensure_ascii=False, indent=2))
         return 0
-    seat_no = item.get("no") or item.get("spaceName") or ""
-    area = item.get("areaName") or item.get("nameMerge") or ""
-    status_name = item.get("statusname") or item.get("status_name") or ""
-    brightness = item.get("brightness")
-    device_id = item.get("id")
-    area_id = item.get("area_id")
 
     out = {
-        "area_id": area_id,
-        "seat_no": seat_no,
-        "status": status_name,
-        "brightness": brightness,
-        "device_id": device_id,
-        "area": area,
+        "area_id": item.get("area_id"),
+        "seat_no": item.get("no") or item.get("spaceName") or "",
+        "status": item.get("statusname") or item.get("status_name") or "",
+        "brightness": item.get("brightness"),
+        "device_id": item.get("id"),
+        "area": item.get("areaName") or item.get("nameMerge") or "",
         "beginTime": item.get("beginTime"),
         "endTime": item.get("endTime"),
     }
@@ -1145,225 +1153,198 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_book(args: argparse.Namespace) -> int:
+    seat = (args.seat or "").strip() if getattr(args, "seat", None) else ""
+    if seat:
+        if getattr(args, "by_id", False):
+            args.seat_id = seat
+            args.seat_no = None
+        else:
+            args.seat_no = seat
+            args.seat_id = None
+    else:
+        args.seat_id = None
+        args.seat_no = None
+    return _cmd_space_book(args)
+
+
+def _cmd_light(args: argparse.Namespace) -> int:
+    args.brightness = _parse_light_arg(args.value)
+    return _cmd_light_set(args)
+
+
+def _cmd_pomo(args: argparse.Namespace) -> int:
+    total_sec = _parse_duration_to_seconds(args.duration)
+
+    low: int | None = args.low
+    high: int | None = args.high
+    if args.flash:
+        parts = str(args.flash).split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ConfigError(f"--flash 格式错误：{args.flash}（应为 LO:HI，例如 20:40）")
+        try:
+            low = int(parts[0])
+            high = int(parts[1])
+        except ValueError as e:
+            raise ConfigError(f"--flash 的值必须是整数：{args.flash}") from e
+
+    args.low = 20 if low is None else int(low)
+    args.high = 40 if high is None else int(high)
+    args.seconds = total_sec
+    args.minutes = total_sec / 60.0
+    return _cmd_pomo_start(args)
+
+
+def _cmd_seats(args: argparse.Namespace) -> int:
+    # Default to free-only; --all shows everything.
+    args.status = [] if getattr(args, "show_all", False) else ["1"]
+    return _cmd_seat_list(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lcc")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_auth = sub.add_parser("auth", help="管理 token/cookie（写入当前目录 .lcc.json）")
+    # === login ===
+    p_login = sub.add_parser("login", help="北航 SSO 登录（从 .env 读账号密码）")
+    p_login.add_argument("--username", help="学号/工号；不传则读 .env 的 LCC_USERNAME")
+    p_login.add_argument("--password", help="SSO 密码（不传则交互式输入）")
+    p_login.add_argument("--seed-cookie", help=argparse.SUPPRESS)
+    p_login.add_argument("--base-url", default=None, help=argparse.SUPPRESS)
+    p_login.add_argument("--timeout", type=float, default=20.0, help=argparse.SUPPRESS)
+    p_login.add_argument("--no-prompt", action="store_true", help="不交互（缺密码时直接报错）")
+    p_login.set_defaults(func=_cmd_auth_login, insecure=False)
+
+    # === me ===
+    p_me = sub.add_parser("me", help="当前预约/座位状态摘要（--raw 输出完整 JSON）")
+    p_me.add_argument("--raw", action="store_true", help="输出完整 subscribe 响应")
+    p_me.add_argument("--prefer-area-id", help=argparse.SUPPRESS)
+    p_me.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_me.set_defaults(func=_cmd_me, insecure=False)
+
+    # === book ===
+    p_book = sub.add_parser(
+        "book",
+        help="预约座位（无参数：列出空位交互选择；传数字：按座位号直接预约）",
+    )
+    p_book.add_argument("seat", nargs="?", help="座位号（默认按 no；配合 --id 则为座位 id）")
+    p_book.add_argument("--id", dest="by_id", action="store_true", help="把 seat 解释为座位 id 而不是座位号")
+    p_book.add_argument("--area", dest="area_id", help="区域（id 或名字，模糊匹配）")
+    p_book.add_argument("--day", help="日期 YYYY-MM-DD（默认今天）")
+    p_book.add_argument("--start", dest="start_time", help="开始时间 HH:MM（默认当前时间）")
+    p_book.add_argument("--all", action="store_true", help="展示所有座位（默认仅空闲）")
+    p_book.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    p_book.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_book.set_defaults(
+        func=_cmd_book,
+        insecure=False,
+        end_time=None,
+        segment=None,
+        crypto_day=None,
+    )
+
+    # === signin / leave / checkout ===
+    for _name, _func, _help in (
+        ("signin", _cmd_space_signin, "签到（到馆）"),
+        ("leave", _cmd_space_leave, "暂离"),
+        ("checkout", _cmd_space_finish, "离馆"),
+    ):
+        _p = sub.add_parser(_name, help=_help)
+        _p.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+        _p.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+        _p.add_argument("--style", choices=["device_points", "id", "space_id"], default="device_points", help=argparse.SUPPRESS)
+        _p.add_argument("--day", help=argparse.SUPPRESS)
+        _p.add_argument("--data", help=argparse.SUPPRESS)
+        _p.add_argument("--prefer-area-id", help=argparse.SUPPRESS)
+        _p.set_defaults(func=_func, insecure=False)
+
+    # === seats ===
+    p_seats = sub.add_parser("seats", help="查询空位（默认仅空闲；--all 显示全部）")
+    p_seats.add_argument("--area", dest="area_id", help="区域（id 或名字）")
+    p_seats.add_argument("--day", help="日期 YYYY-MM-DD（默认今天）")
+    p_seats.add_argument("--start", dest="start_time", help="开始时间 HH:MM（默认当前时间）")
+    p_seats.add_argument("--end", dest="end_time", help="结束时间 HH:MM（默认 23:00）")
+    p_seats.add_argument("--all", dest="show_all", action="store_true", help="显示全部座位（含已预约/占用）")
+    p_seats.add_argument("--json", action="store_true", help="输出原始 JSON")
+    p_seats.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_seats.set_defaults(
+        func=_cmd_seats,
+        insecure=False,
+        label_id=[],
+        prefer_area_id=None,
+        area_from_subscribe=False,
+        status_name_contains=None,
+        not_status=[],
+    )
+
+    # === areas ===
+    p_areas = sub.add_parser("areas", help="列出所有校区/楼层/区域（树形，结果缓存 24h）")
+    p_areas.add_argument("--day", help=argparse.SUPPRESS)
+    p_areas.add_argument("--json", action="store_true", help="输出原始 JSON")
+    p_areas.add_argument("--flat", action="store_true", help="扁平输出（id  完整路径  free/total）")
+    p_areas.add_argument("--refresh", action="store_true", help="跳过缓存，强制重新拉取")
+    p_areas.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_areas.set_defaults(func=_cmd_area_list, insecure=False)
+
+    # === light ===
+    p_light = sub.add_parser("light", help="设置阅读灯亮度（on=20, off=0, 或传 0-100）")
+    p_light.add_argument("value", help="on / off / 0-100")
+    p_light.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_light.set_defaults(
+        func=_cmd_light,
+        insecure=False,
+        device_id=None,
+        area_id=None,
+        prefer_area_id=None,
+    )
+
+    # === pomo ===
+    p_pomo = sub.add_parser("pomo", help="番茄钟（到点闪灯；默认 25m，20↔40）")
+    p_pomo.add_argument("duration", nargs="?", default="25m", help="时长：25 / 25m / 1h（默认 25m）")
+    p_pomo.add_argument("low", nargs="?", type=int, default=None, help="低亮度（默认 20）")
+    p_pomo.add_argument("high", nargs="?", type=int, default=None, help="高亮度（默认 40）")
+    p_pomo.add_argument("--flash", help="LO:HI，如 20:40（等价于两个位置参数）")
+    p_pomo.add_argument("--cycles", type=int, default=2, help="到达高亮度的次数（默认 2）")
+    p_pomo.add_argument("--interval", type=float, default=0.0, help=argparse.SUPPRESS)
+    p_pomo.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_pomo.set_defaults(func=_cmd_pomo, insecure=False, prefer_area_id=None)
+
+    # === config ===
+    p_config = sub.add_parser("config", help="写入默认值到 .lcc.json（如默认区域）")
+    p_config.add_argument("--default-area", dest="default_area_id", help="常用区域（id 或名字）")
+    p_config.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_config.set_defaults(func=_prefs_set, insecure=False)
+
+    # === hidden: auth / crypto (no help= → omitted from --help) ===
+    p_auth = sub.add_parser("auth")
     sub_auth = p_auth.add_subparsers(dest="auth_cmd", required=True)
 
-    p_auth_set = sub_auth.add_parser("set", help="写入认证信息")
-    p_auth_set.add_argument("--token", required=True, help="JWT token（不含 bearer 前缀）")
-    p_auth_set.add_argument("--cookie", required=True, help="原样粘贴 cookie 字符串（例如 'PHPSESSID=...; _zte_cid_=...'）")
-    p_auth_set.add_argument("--base-url", default=None, help="接口 base url（默认 https://booking.lib.buaa.edu.cn）")
-    p_auth_set.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
+    p_auth_set = sub_auth.add_parser("set")
+    p_auth_set.add_argument("--token", required=True)
+    p_auth_set.add_argument("--cookie", required=True)
+    p_auth_set.add_argument("--base-url", default=None)
+    p_auth_set.add_argument("--insecure", action="store_true")
     p_auth_set.set_defaults(func=_cmd_auth_set)
 
-    p_auth_show = sub_auth.add_parser("show", help="查看当前认证信息（脱敏）")
+    p_auth_show = sub_auth.add_parser("show")
     p_auth_show.set_defaults(func=_cmd_auth_show)
 
-    p_auth_clear = sub_auth.add_parser("clear", help="删除 .lcc.json")
+    p_auth_clear = sub_auth.add_parser("clear")
     p_auth_clear.set_defaults(func=_cmd_auth_clear)
 
-    p_auth_login = sub_auth.add_parser("login", help="使用北航 SSO(CAS) 自动登录并获取 token（优先从 .env 读账号密码）")
-    p_auth_login.add_argument("--username", help="学号/工号（SSO 账号），不传则读 .env 的 LCC_USERNAME")
-    p_auth_login.add_argument("--password", help="SSO 密码（不传则交互式输入）")
-    p_auth_login.add_argument("--seed-cookie", help="可选：用已有 booking cookie 预填（例如包含 _zte_cid_）")
-    p_auth_login.add_argument("--base-url", default=None, help="接口 base url（默认 https://booking.lib.buaa.edu.cn）")
-    p_auth_login.add_argument("--timeout", type=float, default=20.0, help="请求超时秒数")
-    p_auth_login.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_auth_login.add_argument("--no-prompt", action="store_true", help="不进行交互式输入（缺少密码时直接报错）")
-    p_auth_login.set_defaults(func=_cmd_auth_login)
-
-    p_light = sub.add_parser("light", help="灯光相关")
-    sub_light = p_light.add_subparsers(dest="light_cmd", required=True)
-
-    p_light_set = sub_light.add_parser("set", help="设置亮度")
-    p_light_set.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_light_set.add_argument("--device-id", help="可选：指定 smartDevice id（必须出现在当前账号的 subscribe(hasLight=1) 里）")
-    p_light_set.add_argument("--area-id", help="可选：配合 --device-id 进一步限定 area_id（同样必须匹配 subscribe）")
-    p_light_set.add_argument("--brightness", required=True, type=int, help="亮度值（例如 19）")
-    p_light_set.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_light_set.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_light_set.set_defaults(func=_cmd_light_set)
-
-    p_light_list = sub_light.add_parser("list", help="列出灯光/设备（需要你提供抓包到的列表接口 path）")
-    p_light_list.add_argument("--path", required=True, help="接口路径（例如 /reserve/smartDevice/xxx）")
-    p_light_list.add_argument("--area-id", help="可选：仅传 area_id（等价于 --data '{\"area_id\":\"...\"}'）")
-    p_light_list.add_argument("--data", help="可选：POST JSON 字符串（例如 '{\"area_id\":\"8\"}'）")
-    p_light_list.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_light_list.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_light_list.set_defaults(func=_cmd_light_list)
-
-    p_pomo = sub.add_parser("pomo", help="番茄钟（时间到后闪烁灯光）")
-    sub_pomo = p_pomo.add_subparsers(dest="pomo_cmd", required=True)
-
-    p_pomo_start = sub_pomo.add_parser("start", help="开始番茄钟")
-    p_pomo_start.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_pomo_start.add_argument("--minutes", type=float, default=25.0, help="时长（分钟，默认 25）")
-    p_pomo_start.add_argument("--seconds", type=float, help="时长（秒，优先级高于 --minutes，用于测试）")
-    p_pomo_start.add_argument("--low", type=int, default=20, help="结束时闪烁的低亮度（默认 20）")
-    p_pomo_start.add_argument("--high", type=int, default=40, help="结束时闪烁的高亮度（默认 40）")
-    p_pomo_start.add_argument("--cycles", type=int, default=2, help="到达高亮度的次数（默认 2）")
-    p_pomo_start.add_argument("--interval", type=float, default=0.0, help="每次亮度变化间隔秒数（默认 0，建议网慢时保持 0）")
-    p_pomo_start.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_pomo_start.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_pomo_start.set_defaults(func=_cmd_pomo_start)
-
-    p_pomo_flash = sub_pomo.add_parser("flash", help="立即执行一次闪烁（便于测试）")
-    p_pomo_flash.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_pomo_flash.add_argument("--low", type=int, default=20, help="低亮度（默认 20）")
-    p_pomo_flash.add_argument("--high", type=int, default=40, help="高亮度（默认 40）")
-    p_pomo_flash.add_argument("--cycles", type=int, default=2, help="到达高亮度的次数（默认 2）")
-    p_pomo_flash.add_argument("--interval", type=float, default=0.0, help="每次亮度变化间隔秒数（默认 0，建议网慢时保持 0）")
-    p_pomo_flash.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_pomo_flash.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_pomo_flash.set_defaults(func=_cmd_pomo_flash)
-
-    p_me = sub.add_parser("me", help="我的状态")
-    sub_me = p_me.add_subparsers(dest="me_cmd", required=True)
-
-    p_me_sub = sub_me.add_parser("subscribe", help="查询当前账号状态/预约信息（/v4/index/subscribe）")
-    p_me_sub.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_me_sub.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_me_sub.set_defaults(func=_cmd_me_subscribe)
-
-    p_me_current = sub_me.add_parser("current", help="用 subscribe 输出一份精简摘要（座位/亮度）")
-    p_me_current.add_argument("--prefer-area-id", help="如果 subscribe 有多条记录，优先选这个 area_id")
-    p_me_current.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_me_current.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_me_current.set_defaults(func=_cmd_me_current)
-
-    p_area = sub.add_parser("area", help="列出校区/楼层/区域编号（支持按名字查）")
-    sub_area = p_area.add_subparsers(dest="area_cmd", required=True)
-
-    p_area_list = sub_area.add_parser("list", help="列出全部区域（默认树形，结果缓存 24h）")
-    p_area_list.add_argument("--day", help="查询日期 YYYY-MM-DD（默认今天；影响 free/total 计数）")
-    p_area_list.add_argument("--json", action="store_true", help="输出原始 JSON")
-    p_area_list.add_argument("--flat", action="store_true", help="扁平输出（id  完整路径  free/total）")
-    p_area_list.add_argument("--refresh", action="store_true", help="跳过缓存，强制重新拉取")
-    p_area_list.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_area_list.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_area_list.set_defaults(func=_cmd_area_list)
-
-    p_prefs = sub.add_parser("prefs", help="偏好设置（写入 .lcc.json）")
-    sub_prefs = p_prefs.add_subparsers(dest="prefs_cmd", required=True)
-
-    p_prefs_set = sub_prefs.add_parser("set", help="设置默认值")
-    p_prefs_set.add_argument("--default-area-id", help="常用区域 id（seat list 默认使用）")
-    p_prefs_set.set_defaults(func=_prefs_set)
-
-    p_crypto = sub.add_parser("crypto", help="aesjson 加/解密工具（用于调试）")
+    p_crypto = sub.add_parser("crypto")
     sub_crypto = p_crypto.add_subparsers(dest="crypto_cmd", required=True)
 
-    p_crypto_enc = sub_crypto.add_parser("encrypt", help="把明文 JSON 加密为 aesjson")
-    p_crypto_enc.add_argument("--day", help="可选：YYYY-MM-DD 或 YYYYMMDD（默认今天）")
-    p_crypto_enc.add_argument("--data", required=True, help="明文 JSON 字符串（例如 '{\"id\":\"220\"}'）")
+    p_crypto_enc = sub_crypto.add_parser("encrypt")
+    p_crypto_enc.add_argument("--day")
+    p_crypto_enc.add_argument("--data", required=True)
     p_crypto_enc.set_defaults(func=_cmd_crypto_encrypt)
 
-    p_crypto_dec = sub_crypto.add_parser("decrypt", help="把 aesjson 解密回明文")
-    p_crypto_dec.add_argument("--day", help="可选：YYYY-MM-DD 或 YYYYMMDD（默认今天）")
-    p_crypto_dec.add_argument("--aesjson", required=True, help="密文字符串（base64）")
-    p_crypto_dec.add_argument("--json", action="store_true", help="尝试按 JSON 解析输出")
+    p_crypto_dec = sub_crypto.add_parser("decrypt")
+    p_crypto_dec.add_argument("--day")
+    p_crypto_dec.add_argument("--aesjson", required=True)
+    p_crypto_dec.add_argument("--json", action="store_true")
     p_crypto_dec.set_defaults(func=_cmd_crypto_decrypt)
-
-    p_space = sub.add_parser("space", help="座位操作（写操作，可能需要 aesjson）")
-    sub_space = p_space.add_subparsers(dest="space_cmd", required=True)
-
-    p_space_leave = sub_space.add_parser("leave", help="临时离开（/v4/space/leave，需要 aesjson）")
-    p_space_leave.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_space_leave.add_argument(
-        "--style",
-        choices=["device_points", "id", "space_id"],
-        default="device_points",
-        help="payload 结构（默认 device_points：和抓包一致）",
-    )
-    p_space_leave.add_argument("--day", help="可选：用于加密的日期 YYYY-MM-DD（默认今天）")
-    p_space_leave.add_argument("--data", help="手动指定明文 JSON（会被加密成 aesjson）")
-    p_space_leave.add_argument("--dry-run", action="store_true", help="只输出 payload+a​​esjson，不真正请求")
-    p_space_leave.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_space_leave.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_space_leave.set_defaults(func=_cmd_space_leave)
-
-    p_space_signin = sub_space.add_parser("signin", help="签到（/v4/space/signin，需要 aesjson）")
-    p_space_signin.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_space_signin.add_argument(
-        "--style",
-        choices=["device_points", "id", "space_id"],
-        default="device_points",
-        help="payload 结构（默认 device_points：和抓包一致）",
-    )
-    p_space_signin.add_argument("--day", help="可选：用于加密的日期 YYYY-MM-DD（默认今天）")
-    p_space_signin.add_argument("--data", help="手动指定明文 JSON（会被加密成 aesjson）")
-    p_space_signin.add_argument("--dry-run", action="store_true", help="只输出 payload+a​​esjson，不真正请求")
-    p_space_signin.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_space_signin.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_space_signin.set_defaults(func=_cmd_space_signin)
-
-    p_space_action = sub_space.add_parser("action", help="发送任意 space 写接口（需要 aesjson）")
-    p_space_action.add_argument("--path", required=True, help="接口路径（例如 /v4/space/leave）")
-    p_space_action.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_space_action.add_argument(
-        "--style",
-        choices=["device_points", "id", "space_id"],
-        default="device_points",
-        help="payload 结构（默认 device_points：和抓包一致）",
-    )
-    p_space_action.add_argument("--day", help="可选：用于加密的日期 YYYY-MM-DD（默认今天）")
-    p_space_action.add_argument("--data", help="手动指定明文 JSON（会被加密成 aesjson）")
-    p_space_action.add_argument("--dry-run", action="store_true", help="只输出 payload+a​​esjson，不真正请求")
-    p_space_action.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_space_action.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_space_action.set_defaults(func=_cmd_space_action)
-
-    p_space_finish = sub_space.add_parser("finish", help="完全离开（/v4/space/checkout）")
-    p_space_finish.add_argument("--prefer-area-id", help="subscribe 有多条记录时优先选该 area_id")
-    p_space_finish.add_argument(
-        "--style",
-        choices=["device_points", "id", "space_id"],
-        default="device_points",
-        help="payload 结构（默认 device_points：和抓包一致）",
-    )
-    p_space_finish.add_argument("--day", help="可选：用于加密的日期 YYYY-MM-DD（默认今天）")
-    p_space_finish.add_argument("--data", help="手动指定明文 JSON（会被加密成 aesjson）")
-    p_space_finish.add_argument("--dry-run", action="store_true", help="只输出 payload+a​​esjson，不真正请求")
-    p_space_finish.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_space_finish.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_space_finish.set_defaults(func=_cmd_space_finish)
-
-    p_space_book = sub_space.add_parser("book", help="预约座位（/v4/space/confirm，需要 aesjson）")
-    p_space_book.add_argument("--area-id", help="区域 id（不传则用默认 LCC_DEFAULT_AREA_ID / .lcc.json）")
-    p_space_book.add_argument("--day", help="日期 YYYY-MM-DD（默认今天）")
-    p_space_book.add_argument("--start-time", help="开始时间 HH:MM（默认当前时间）")
-    p_space_book.add_argument("--end-time", help="结束时间 HH:MM（默认 23:00）")
-    p_space_book.add_argument("--segment", help="可选：segment（不传则尝试从 seat 接口响应中获取）")
-    p_space_book.add_argument("--seat-id", help="可选：直接指定 seat_id（不交互）")
-    p_space_book.add_argument("--seat-no", help="可选：直接指定 seat no（不交互）")
-    p_space_book.add_argument("--all", action="store_true", help="展示所有座位（默认只展示空闲 status=1）")
-    p_space_book.add_argument("--crypto-day", help="可选：用于 aesjson 加密的日期（默认今天）")
-    p_space_book.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_space_book.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_space_book.add_argument("--dry-run", action="store_true", help="只输出明文 payload+a​​esjson，不真正预约")
-    p_space_book.set_defaults(func=_cmd_space_book)
-
-    p_seat = sub.add_parser("seat", help="座位相关（查询）")
-    sub_seat = p_seat.add_subparsers(dest="seat_cmd", required=True)
-
-    p_seat_list = sub_seat.add_parser("list", help="查询座位列表（/v4/Space/seat）")
-    p_seat_list.add_argument("--area-id", help="区域 id（不传则用默认 LCC_DEFAULT_AREA_ID / .lcc.json）")
-    p_seat_list.add_argument("--prefer-area-id", help="配合 --area-from-subscribe：subscribe 多条记录时优先选该 area_id")
-    p_seat_list.add_argument("--day", help="日期 YYYY-MM-DD（默认今天）")
-    p_seat_list.add_argument("--start-time", help="开始时间 HH:MM（默认当前时间）")
-    p_seat_list.add_argument("--end-time", help="结束时间 HH:MM（默认 23:00）")
-    p_seat_list.add_argument("--area-from-subscribe", action="store_true", help="当没传 --area-id 且没有默认区域时，尝试用 subscribe 获取 area_id")
-    p_seat_list.add_argument("--label-id", action="append", default=[], help="可选：重复传入 label_id（例如 --label-id 1 --label-id 2）")
-    p_seat_list.add_argument("--status", action="append", default=[], help="仅包含这些 status（可重复）")
-    p_seat_list.add_argument("--not-status", action="append", default=[], help="排除这些 status（可重复）")
-    p_seat_list.add_argument("--status-name-contains", help="按 status_name 关键字过滤（例如 空闲）")
-    p_seat_list.add_argument("--json", action="store_true", help="输出原始 JSON")
-    p_seat_list.add_argument("--timeout", type=float, default=15.0, help="请求超时秒数")
-    p_seat_list.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（不推荐）")
-    p_seat_list.set_defaults(func=_cmd_seat_list)
 
     return parser
 
@@ -1435,15 +1416,22 @@ def _prefs_set(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    no_proxy_anywhere = "--no-proxy" in raw_argv
-    if no_proxy_anywhere:
-        raw_argv = [a for a in raw_argv if a != "--no-proxy"]
-        os.environ["LCC_NO_PROXY"] = "1"
+
+    # Global flags that apply to any subcommand; we strip them before argparse.
+    use_proxy = "--proxy" in raw_argv
+    insecure = "--insecure" in raw_argv
+    raw_argv = [a for a in raw_argv if a not in ("--proxy", "--insecure")]
+    if use_proxy:
+        os.environ["LCC_PROXY"] = "1"
+    if insecure:
+        os.environ["LCC_INSECURE"] = "1"
 
     parser = build_parser()
     args = parser.parse_args(raw_argv)
-    if no_proxy_anywhere:
-        setattr(args, "no_proxy", True)
+    if use_proxy:
+        setattr(args, "proxy", True)
+    if insecure:
+        setattr(args, "insecure", True)
     try:
         return int(args.func(args))
     except (ConfigError, HttpError) as e:
