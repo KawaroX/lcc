@@ -1,31 +1,23 @@
 # bhlib
 
-一个简单的命令行工具，对接 **北京航空航天大学（BUAA）图书馆** 的预约系统 `booking.lib.buaa.edu.cn`：查座、预约、签到/暂离/离馆、阅读灯亮度、番茄钟。
-
-作者常用学院路一层西阅学空间（`area_id=8`），所以默认区域倾向它；沙河校区、其它阅览室等通过 `--area 名字或 id` 指定（见下文「列出区域」）。
+命令行工具，对接 **北京航空航天大学（BUAA）图书馆** 的预约系统 `booking.lib.buaa.edu.cn`：查座、预约、签到/暂离/离馆、阅读灯亮度、番茄钟。
 
 ## 免责声明
 
 - 请确保你的使用符合学校/图书馆的服务条款与相关规定。
-- `token` / `cookie` 属于敏感凭证，请勿泄露；本项目已在 `.gitignore` 里忽略 `.bhlib.json` 和 `.env`。
+- `token` / `cookie` / 账号密码存在 `~/.bhlib/config.json`（权限 0600），请勿泄露。
 
 ## 安装
 
-推荐用 [pipx](https://pipx.pypa.io/) 一键安装（需要 Python 3.9+，以及系统有 `openssl`——macOS/Linux 默认都有）：
+需要 Python 3.9+。
 
 ```bash
-# 没有 pipx 的话先装一次：
-#   macOS:  brew install pipx && pipx ensurepath
-#   Linux:  python3 -m pip install --user pipx && python3 -m pipx ensurepath
-
 pipx install git+https://github.com/KawaroX/bhlib.git
 ```
 
-装完后终端里直接用 `bhlib`：
+（没装 pipx 的话先 `brew install pipx && pipx ensurepath` / Linux 用 `python3 -m pip install --user pipx` / Windows 用 `python -m pip install --user pipx && python -m pipx ensurepath`。）
 
-```bash
-bhlib --help
-```
+> Windows 备注：`bhlib pomo` 的加解密调用系统 `openssl`。Windows 默认没有，装一下 Git for Windows（自带）或 [Win64 OpenSSL](https://slproweb.com/products/Win32OpenSSL.html) 即可。
 
 升级 / 卸载：
 
@@ -34,32 +26,16 @@ pipx upgrade bhlib
 pipx uninstall bhlib
 ```
 
-### 开发模式
-
-```bash
-python3 bhlib.py --help
-# 或：
-python3 -m venv .venv && source .venv/bin/activate && pip install -e .
-```
-
-## 登录
-
-最省事的方式：在当前目录放一个 `.env`（参考 `.env.example`），写入：
-
-```
-BHLIB_USERNAME=你的学号
-BHLIB_PASSWORD=你的SSO密码
-```
-
-然后：
+## 登录（一次即可）
 
 ```bash
 bhlib login
+# 学号: ********
+# 密码: ********
+# OK: 登录成功，配置已写入 ~/.bhlib/config.json
 ```
 
-成功后会把 token / cookie 写到 `.bhlib.json`。后续命令在 token 过期时会自动刷新。
-
-如果不想把密码放文件里，运行 `bhlib login --username 你的学号`，会交互式提示密码。
+之后**从任何目录**跑 `bhlib` 都能用。token 到期时会用保存的账号密码自动续约，不需要任何 `.env` 或环境变量。
 
 ## 常用命令
 
@@ -76,7 +52,7 @@ bhlib signin                     # 签到（到馆）
 bhlib leave                      # 暂离
 bhlib checkout                   # 离馆
 
-bhlib seats                      # 默认区域的空闲座位
+bhlib seats                      # 默认区域的空闲座位（未设默认时弹交互列表选）
 bhlib seats --area 一层西 --all  # 某区域所有状态（含已占用）
 
 bhlib areas                      # 所有校区/楼层/区域（树形）
@@ -110,23 +86,6 @@ bhlib config --default-area 一层西   # 设置默认区域
 bhlib seats --area 一层西        # → 学院路一层西阅学空间 (id=8)
 bhlib seats --area 102阅学       # → 沙河一楼 102 阅学空间 (id=63)
 bhlib book --area 六层西         # → 学院路六层西中文借阅室 (id=29)
-```
-
-模糊词可能匹配多个（例如 `三楼`），此时 CLI 会列出候选让你缩小范围。
-
-## 环境变量
-
-- `BHLIB_USERNAME` / `BHLIB_PASSWORD` — `bhlib login` 使用的 SSO 凭证
-- `BHLIB_TOKEN` / `BHLIB_COOKIE` — 覆盖 `.bhlib.json` 里的 token/cookie
-- `BHLIB_DEFAULT_AREA_ID` — 默认区域（也可用 `bhlib config --default-area` 写入 `.bhlib.json`）
-- `BHLIB_PROXY=1` — 走系统代理（默认不走，因为通常在校园网内）
-- `BHLIB_INSECURE=1` — 跳过 HTTPS 证书校验（不推荐）
-
-全局 flag（可放在任何位置）：
-
-```bash
-bhlib --proxy seats              # 这次走系统代理
-bhlib --insecure login           # 这次跳过证书校验
 ```
 
 ## 区域编号参考
@@ -163,21 +122,29 @@ bhlib --insecure login           # 这次跳过证书校验
 | 69/71/72/73 | 三楼/301南、314北、三层西、三层中央 |
 | 82/83 | 六楼/601南、613北 |
 
-## SSL 证书校验失败
+## 可选：环境变量覆盖
 
-如果遇到 `CERTIFICATE_VERIFY_FAILED`，通常是本机 Python 没有正确安装/找到系统根证书：
+正常使用不需要。给 CI / 脚本 / 临时切账号用：
 
-- macOS 用 python.org 安装包时，运行一次 `Install Certificates.command`；
-- 或在 Python 环境里 `pip install --upgrade certifi`。
+- `BHLIB_USERNAME` / `BHLIB_PASSWORD` — 覆盖 config 里存的凭证
+- `BHLIB_TOKEN` / `BHLIB_COOKIE` — 覆盖 config 里的 token / cookie
+- `BHLIB_DEFAULT_AREA_ID` — 覆盖默认区域
+- `BHLIB_PROXY=1` — 走系统代理（默认不走，因为通常在校园网内）
+- `BHLIB_INSECURE=1` — 跳过 HTTPS 证书校验（不推荐）
 
-临时绕过（不推荐）：
+全局 flag（可放在任何位置）：
 
 ```bash
-bhlib --insecure login
+bhlib --proxy seats              # 这次走系统代理
+bhlib --insecure login           # 这次跳过证书校验
 ```
 
 ## 安全提示
 
-- `.bhlib.json` 和 `.env` 里是你的 token/cookie/账号密码，不要提交到 Git。
+- `~/.bhlib/config.json` 里是明文的账号密码 + token（模仿你之前 `.env` 的做法，文件权限 0600 只有你能读）。
 - Token 是 JWT，包含学号、姓名等个人信息；贴抓包/日志时请脱敏。
 - 怀疑泄露了 token，重新 `bhlib login` 会让旧 token 作废；必要时修改 SSO 密码。
+
+## 证书说明
+
+`booking.lib.buaa.edu.cn` 的 HTTPS 证书链**只发送叶子证书**，不带 GlobalSign 中间 CA。浏览器和 macOS Keychain 会自动 AIA fetch，但 Python `urllib` 不会。本项目把 `GlobalSign GCC R3 DV TLS CA 2020` 中间证书打包进 `src/bhlib/certs/booking_ca.pem`，并加到 SSLContext 里，所以装完即用，不需要额外 `pipx inject certifi` 或 `Install Certificates.command`。

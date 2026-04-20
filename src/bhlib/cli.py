@@ -41,6 +41,45 @@ def _effective_use_proxy(args: argparse.Namespace) -> bool:
     return False
 
 
+def _interactive_pick_area(args: argparse.Namespace, auth) -> str:
+    """Show a flat list of areas with free/total and ask the user to pick one.
+    Returns the chosen area_id as a string. Raises ConfigError on cancel.
+    """
+    verify_ssl = _effective_verify_ssl(auth, args)
+    tree = get_or_fetch_tree(
+        timeout_sec=float(getattr(args, "timeout", 15.0)),
+        insecure=bool(getattr(args, "insecure", False)),
+        verify_ssl=verify_ssl,
+        use_proxy=_effective_use_proxy(args),
+    )
+    items = flatten_areas(tree)
+    if not items:
+        raise ConfigError("获取区域列表为空")
+
+    print("未设置默认区域，请选择：")
+    for idx, a in enumerate(items, 1):
+        label = f"{a.get('premiseName', '')} / {a.get('storeyName', '')} / {a.get('name', '')}".strip(" /")
+        free = a.get("freeNum")
+        total = a.get("totalNum")
+        suffix = f"  [{free}/{total}]" if free is not None and total is not None else ""
+        print(f"  {idx:>3}. {label}{suffix}  (id={a.get('id')})")
+    try:
+        raw = input("序号 / 名字 / id: ").strip()
+    except EOFError:
+        raise ConfigError("未选择区域") from None
+    if not raw:
+        raise ConfigError("未选择区域")
+
+    # numeric index into the list
+    if raw.isdigit():
+        n = int(raw)
+        if 1 <= n <= len(items):
+            return str(items[n - 1]["id"])
+        # else treat as area id
+
+    return str(resolve_area_id(raw, tree=tree))
+
+
 def _parse_light_arg(v: str) -> int:
     """on → 20, off → 0, otherwise int in [0, 100]."""
     s = str(v or "").strip().lower()
@@ -465,7 +504,7 @@ def _cmd_auth_set(args: argparse.Namespace) -> int:
         verify_ssl=(not args.insecure),
         default_area_id=default_area_id,
     )
-    print("OK: 已写入 .bhlib.json（当前目录）")
+    print("OK: 已写入 ~/.bhlib/config.json")
     return 0
 
 
@@ -492,21 +531,36 @@ def _cmd_auth_show(args: argparse.Namespace) -> int:
 
 def _cmd_auth_clear(args: argparse.Namespace) -> int:
     clear_auth()
-    print("OK: 已删除 .bhlib.json")
+    print("OK: 已删除 ~/.bhlib/config.json")
     return 0
 
 
 def _cmd_auth_login(args: argparse.Namespace) -> int:
     env = load_env()
-    username = args.username or (env.get("BHLIB_USERNAME") or "").strip()
-    if not username:
-        raise ConfigError("缺少 username：请传 --username 或在 .env 里设置 BHLIB_USERNAME")
 
-    password = args.password or (env.get("BHLIB_PASSWORD") or "")
+    username = (
+        (args.username or "").strip()
+        or (env.get("BHLIB_USERNAME") or "").strip()
+        or (load_auth_loose().username or "").strip()
+    )
+    if not username:
+        if args.no_prompt:
+            raise ConfigError("缺少 username：请传 --username 或设置 BHLIB_USERNAME")
+        username = input("学号: ").strip()
+        if not username:
+            raise ConfigError("学号不能为空")
+
+    password = (
+        args.password
+        or (env.get("BHLIB_PASSWORD") or "")
+    )
     if not password:
         if args.no_prompt:
-            raise ConfigError("缺少密码：请传 --password 或在 .env 里设置 BHLIB_PASSWORD")
-        password = getpass("Password: ")
+            raise ConfigError("缺少密码：请传 --password 或设置 BHLIB_PASSWORD")
+        password = getpass("密码: ")
+        if not password:
+            raise ConfigError("密码不能为空")
+
     try:
         result = cas_login(
             username=username,
@@ -520,7 +574,7 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
 
     default_area_id = None
     try:
-        default_area_id = load_auth().default_area_id
+        default_area_id = load_auth_loose().default_area_id
     except ConfigError:
         default_area_id = None
     save_auth(
@@ -529,8 +583,10 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         base_url=args.base_url,
         verify_ssl=(not args.insecure),
         default_area_id=default_area_id,
+        username=username,
+        password=password,
     )
-    print("OK: 登录成功，已写入 .bhlib.json（token + booking 域 cookie）")
+    print(f"OK: 登录成功（{username}），配置已写入 ~/.bhlib/config.json")
     return 0
 
 
@@ -881,7 +937,7 @@ def _cmd_space_book(args: argparse.Namespace) -> int:
 
     area_id = _resolve_area_id_maybe(args.area_id, args, auth=auth) or auth.default_area_id
     if not area_id:
-        raise ConfigError("缺少 area_id：请传 --area-id 或设置默认 BHLIB_DEFAULT_AREA_ID")
+        area_id = _interactive_pick_area(args, auth)
 
     if start_time >= end_time:
         raise ConfigError(f"时间区间无效：start_time={start_time} end_time={end_time}")
@@ -1086,7 +1142,7 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
         item = _pick_my_active_item(sub, prefer_area_id=args.prefer_area_id)
         area_id = str(item.get("area_id") or "").strip() or None
     if not area_id:
-        raise ConfigError("缺少 area_id：请传 --area-id 或在 .env/.bhlib.json 设置默认 BHLIB_DEFAULT_AREA_ID（或用 --area-from-subscribe）")
+        area_id = _interactive_pick_area(args, auth)
 
     if (args.start_time is None) and (args.end_time is None) and start_time >= end_time:
         raise ConfigError(f"默认时间区间无效：start_time={start_time} end_time={end_time}（请手动指定 --start-time/--end-time 或 --day）")
@@ -1545,7 +1601,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pomo_daemon.set_defaults(func=_cmd_pomo_daemon, insecure=False)
 
     # === config ===
-    p_config = sub.add_parser("config", help="写入默认值到 .bhlib.json（如默认区域）")
+    p_config = sub.add_parser("config", help="写入默认值到 ~/.bhlib/config.json（如默认区域）")
     p_config.add_argument("--default-area", dest="default_area_id", help="常用区域（id 或名字）")
     p_config.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     p_config.set_defaults(func=_prefs_set, insecure=False)
@@ -1642,7 +1698,7 @@ def _prefs_set(args: argparse.Namespace) -> int:
         raise ConfigError("请至少传一个字段（例如 --default-area-id 8）")
     resolved = _resolve_area_id_maybe(args.default_area_id, args)
     update_defaults(default_area_id=resolved)
-    msg = f"OK: 已更新 .bhlib.json (default_area_id={resolved})"
+    msg = f"OK: 已更新 ~/.bhlib/config.json (default_area_id={resolved})"
     if resolved != args.default_area_id:
         msg += f"  ← 解析自 '{args.default_area_id}'"
     print(msg)
@@ -1673,6 +1729,9 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["BHLIB_INSECURE"] = "1"
 
     parser = build_parser()
+    if not raw_argv:
+        parser.print_help()
+        return 0
     args = parser.parse_args(raw_argv)
     if use_proxy:
         setattr(args, "proxy", True)

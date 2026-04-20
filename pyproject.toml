@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bhlib"
-version = "0.2.0"
+version = "0.3.0"
 description = "CLI for booking.lib.buaa.edu.cn (BUAA library)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "UNLICENSED" }
 authors = [{ name = "kawarox" }]
+dependencies = [
+  "certifi>=2024.0.0",
+]
 
 [project.scripts]
 bhlib = "bhlib.cli:main"
@@ -19,3 +22,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+bhlib = ["certs/*.pem"]

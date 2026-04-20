@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-import ssl
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.response
 from dataclasses import dataclass
 from http.cookiejar import Cookie, CookieJar
+
+from .ssl_ctx import make_ssl_context
 
 
 class CasLoginError(RuntimeError):
@@ -106,7 +106,7 @@ def cas_login(
     user_agent: str | None = None,
     timeout_sec: float = 20.0,
     verify_ssl: bool = True,
-    use_proxy: bool | None = None,
+    use_proxy: bool = False,
 ) -> CasLoginResult:
     """
     CAS 登录并换取 booking.lib.buaa.edu.cn 的 JWT token。
@@ -126,29 +126,7 @@ def cas_login(
         "Chrome/146.0.0.0 Safari/537.36"
     )
 
-    if use_proxy is None:
-        v = (os.environ.get("BHLIB_NO_PROXY") or "").strip().lower()
-        use_proxy = v not in ("1", "true", "yes", "on")
-
-    # If TLS is being broken by a proxy/middlebox, retry once with proxy disabled.
-    if bool(use_proxy):
-        try:
-            return cas_login(
-                username=username,
-                password=password,
-                service_url=service_url,
-                sso_login_base=sso_login_base,
-                initial_booking_cookie=initial_booking_cookie,
-                user_agent=user_agent,
-                timeout_sec=timeout_sec,
-                verify_ssl=verify_ssl,
-                use_proxy=False,
-            )
-        except Exception:  # noqa: BLE001
-            # Fall through to normal flow below.
-            pass
-
-    ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()  # noqa: SLF001
+    ctx = make_ssl_context(verify_ssl=verify_ssl)
     jar = CookieJar()
     redirect = _RedirectRecorder()
     handlers: list[urllib.request.BaseHandler] = [
@@ -182,8 +160,6 @@ def cas_login(
             html = resp.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as e:
         msg = f"获取 SSO 登录页失败: {e}"
-        if "EOF occurred in violation of protocol" in str(e):
-            msg += "（提示：这通常是代理/中间人导致 TLS 被截断；可设置 BHLIB_NO_PROXY=1）"
         raise CasLoginError(msg) from e
 
     execution = _extract_execution(html)
@@ -220,8 +196,6 @@ def cas_login(
         raise CasLoginError(f"SSO 登录失败（HTTP {e.code}）") from e
     except urllib.error.URLError as e:
         msg = f"SSO 登录请求失败: {e}"
-        if "EOF occurred in violation of protocol" in str(e):
-            msg += "（提示：这通常是代理/中间人导致 TLS 被截断；可设置 BHLIB_NO_PROXY=1）"
         raise CasLoginError(msg) from e
 
     cas = _extract_cas_from_urls([final_url, *redirect.locations])
@@ -252,8 +226,6 @@ def cas_login(
         raise CasLoginError(f"换取 token 失败（HTTP {e.code}）: {raw[:200]}") from e
     except urllib.error.URLError as e:
         msg = f"换取 token 网络错误: {e}"
-        if "EOF occurred in violation of protocol" in str(e):
-            msg += "（提示：这通常是代理/中间人导致 TLS 被截断；可设置 BHLIB_NO_PROXY=1）"
         raise CasLoginError(msg) from e
 
     try:

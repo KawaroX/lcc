@@ -9,7 +9,8 @@ from typing import Any
 from .env import load_env
 
 DEFAULT_BASE_URL = "https://booking.lib.buaa.edu.cn"
-CONFIG_FILENAME = ".bhlib.json"
+CONFIG_DIR = Path.home() / ".bhlib"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
 class ConfigError(RuntimeError):
@@ -23,10 +24,34 @@ class AuthConfig:
     base_url: str = DEFAULT_BASE_URL
     verify_ssl: bool = True
     default_area_id: str | None = None
+    username: str | None = None
+    password: str | None = None
 
 
 def _config_path() -> Path:
-    return Path.cwd() / CONFIG_FILENAME
+    return CONFIG_FILE
+
+
+def _ensure_dir() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _write(data: dict[str, Any]) -> None:
+    _ensure_dir()
+    CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _load_file() -> dict[str, Any]:
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{CONFIG_FILE} 不是合法 JSON: {e}") from e
 
 
 def save_auth(
@@ -36,6 +61,8 @@ def save_auth(
     base_url: str | None = None,
     verify_ssl: bool = True,
     default_area_id: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
 ) -> None:
     token = (token or "").strip()
     cookie = (cookie or "").strip()
@@ -44,110 +71,98 @@ def save_auth(
     if not cookie:
         raise ConfigError("cookie 为空")
 
-    data = {
-        "token": token,
-        "cookie": cookie,
-        "base_url": (base_url or DEFAULT_BASE_URL).strip(),
-        "verify_ssl": bool(verify_ssl),
-        "default_area_id": (str(default_area_id).strip() if default_area_id is not None else None),
-    }
-    _config_path().write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    data = _load_file()
+    data["token"] = token
+    data["cookie"] = cookie
+    data["base_url"] = (base_url or data.get("base_url") or DEFAULT_BASE_URL).strip()
+    data["verify_ssl"] = bool(verify_ssl)
+    if default_area_id is not None:
+        data["default_area_id"] = str(default_area_id).strip() or None
+    if username is not None:
+        data["username"] = username.strip()
+    if password is not None:
+        data["password"] = password
+    _write(data)
+
+
+def save_credentials(*, username: str, password: str) -> None:
+    """Persist SSO credentials so the daemon can auto-refresh tokens without env vars."""
+    data = _load_file()
+    data["username"] = username.strip()
+    data["password"] = password
+    _write(data)
 
 
 def clear_auth() -> None:
-    path = _config_path()
-    if path.exists():
-        path.unlink()
+    if CONFIG_FILE.exists():
+        CONFIG_FILE.unlink()
 
 
-def _load_file(path: Path) -> dict[str, Any]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as e:
-        raise ConfigError(f"{CONFIG_FILENAME} 不是合法 JSON: {e}") from e
+def _pick(key: str, *, file_data: dict, env_file: dict, env_key: str | None = None) -> str:
+    """Resolution order: real env var > .env file > config file."""
+    real_key = env_key or f"BHLIB_{key.upper()}"
+    return (
+        os.environ.get(real_key)
+        or env_file.get(real_key)
+        or str(file_data.get(key) or "")
+    ).strip()
 
 
 def load_auth() -> AuthConfig:
-    file_data = _load_file(_config_path())
-    env_file = load_env()
-
-    token = (os.environ.get("BHLIB_TOKEN") or env_file.get("BHLIB_TOKEN") or file_data.get("token") or "").strip()
-    cookie = (os.environ.get("BHLIB_COOKIE") or env_file.get("BHLIB_COOKIE") or file_data.get("cookie") or "").strip()
-    base_url = (os.environ.get("BHLIB_BASE_URL") or env_file.get("BHLIB_BASE_URL") or file_data.get("base_url") or DEFAULT_BASE_URL).strip()
-    env_insecure = (os.environ.get("BHLIB_INSECURE") or env_file.get("BHLIB_INSECURE") or "").strip()
-    if env_insecure:
-        verify_ssl = False
-    else:
-        verify_ssl = bool(file_data.get("verify_ssl", True))
-
-    default_area_id = (
-        os.environ.get("BHLIB_DEFAULT_AREA_ID")
-        or env_file.get("BHLIB_DEFAULT_AREA_ID")
-        or file_data.get("default_area_id")
-        or ""
-    ).strip() or None
-
-    if not token:
-        raise ConfigError("缺少 token：请先运行 `bhlib login` / `bhlib auth set`，或在 .env 里放账号让 CLI 自动登录")
-    if not cookie:
-        raise ConfigError("缺少 cookie：请先运行 `bhlib login` / `bhlib auth set`")
-
-    return AuthConfig(
-        token=token,
-        cookie=cookie,
-        base_url=base_url,
-        verify_ssl=verify_ssl,
-        default_area_id=default_area_id,
-    )
+    auth = load_auth_loose()
+    if not auth.token:
+        raise ConfigError("缺少 token：请先运行 `bhlib login`")
+    if not auth.cookie:
+        raise ConfigError("缺少 cookie：请先运行 `bhlib login`")
+    return auth
 
 
 def load_auth_loose() -> AuthConfig:
-    """
-    Like load_auth(), but allows missing token/cookie (for bootstrapping auto-login).
-    """
-    file_data = _load_file(_config_path())
+    """Like load_auth() but tolerates missing token/cookie (for bootstrap)."""
+    file_data = _load_file()
     env_file = load_env()
-    token = (os.environ.get("BHLIB_TOKEN") or env_file.get("BHLIB_TOKEN") or file_data.get("token") or "").strip()
-    cookie = (os.environ.get("BHLIB_COOKIE") or env_file.get("BHLIB_COOKIE") or file_data.get("cookie") or "").strip()
-    base_url = (os.environ.get("BHLIB_BASE_URL") or env_file.get("BHLIB_BASE_URL") or file_data.get("base_url") or DEFAULT_BASE_URL).strip()
-    env_insecure = (os.environ.get("BHLIB_INSECURE") or env_file.get("BHLIB_INSECURE") or "").strip()
+
+    token = _pick("token", file_data=file_data, env_file=env_file)
+    cookie = _pick("cookie", file_data=file_data, env_file=env_file)
+    base_url = _pick("base_url", file_data=file_data, env_file=env_file) or DEFAULT_BASE_URL
+
+    env_insecure = _pick("insecure", file_data={}, env_file=env_file)
     verify_ssl = False if env_insecure else bool(file_data.get("verify_ssl", True))
-    default_area_id = (
-        os.environ.get("BHLIB_DEFAULT_AREA_ID")
-        or env_file.get("BHLIB_DEFAULT_AREA_ID")
-        or file_data.get("default_area_id")
+
+    default_area_id = _pick("default_area_id", file_data=file_data, env_file=env_file) or None
+    username = _pick("username", file_data=file_data, env_file=env_file) or None
+    password = (
+        os.environ.get("BHLIB_PASSWORD")
+        or env_file.get("BHLIB_PASSWORD")
+        or file_data.get("password")
         or ""
-    ).strip() or None
+    )
+    password = password or None
+
     return AuthConfig(
         token=token,
         cookie=cookie,
         base_url=base_url,
         verify_ssl=verify_ssl,
         default_area_id=default_area_id,
+        username=username,
+        password=password,
     )
 
 
 def update_defaults(*, default_area_id: str | None = None) -> None:
-    """
-    Update defaults in .bhlib.json without touching token/cookie.
-    """
-    path = _config_path()
-    data = _load_file(path)
+    """Update defaults without touching token/cookie."""
+    data = _load_file()
     if default_area_id is not None:
         data["default_area_id"] = str(default_area_id).strip() or None
     if not data:
-        raise ConfigError("未找到 .bhlib.json：请先运行一次 `bhlib auth set` 或 `bhlib login`")
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        raise ConfigError("配置为空：请先运行 `bhlib login`")
+    _write(data)
 
 
 def get_cached_area_tree(*, max_age_sec: int = 86400) -> dict | None:
-    """
-    Return cached area tree if fresh (default TTL 24h). None otherwise.
-    """
     import time as _t
-    data = _load_file(_config_path())
+    data = _load_file()
     cache = data.get("area_tree_cache")
     if not isinstance(cache, dict):
         return None
@@ -161,21 +176,14 @@ def get_cached_area_tree(*, max_age_sec: int = 86400) -> dict | None:
 
 
 def cache_area_tree(tree: dict) -> None:
-    """
-    Persist area tree cache into .bhlib.json.
-    """
     import time as _t
-    path = _config_path()
-    data = _load_file(path)
+    data = _load_file()
     data["area_tree_cache"] = {"fetched_at": int(_t.time()), "tree": tree}
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write(data)
 
 
 def get_cached_segment(*, area_id: str, start_time: str, end_time: str) -> str | None:
-    """
-    Return cached segment for a (area_id, start_time, end_time) triple.
-    """
-    data = _load_file(_config_path())
+    data = _load_file()
     cache = data.get("segment_cache")
     if not isinstance(cache, dict):
         return None
@@ -185,39 +193,27 @@ def get_cached_segment(*, area_id: str, start_time: str, end_time: str) -> str |
 
 
 def cache_segment(*, area_id: str, start_time: str, end_time: str, segment: str) -> None:
-    """
-    Persist segment cache into .bhlib.json.
-    """
     segment = str(segment).strip()
     if not segment:
         return
-    path = _config_path()
-    data = _load_file(path)
+    data = _load_file()
     cache = data.get("segment_cache")
     if not isinstance(cache, dict):
         cache = {}
     key = f"{str(area_id).strip()}|{str(start_time).strip()}|{str(end_time).strip()}"
     cache[key] = segment
     data["segment_cache"] = cache
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write(data)
 
 
 def save_pomo_state(state: dict) -> None:
-    """
-    Save pomodoro daemon state to .bhlib.json.
-    """
-    path = _config_path()
-    data = _load_file(path)
+    data = _load_file()
     data["pomo_daemon"] = state
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write(data)
 
 
 def load_pomo_state() -> dict | None:
-    """
-    Load pomodoro daemon state from .bhlib.json.
-    Returns None if no state exists.
-    """
-    data = _load_file(_config_path())
+    data = _load_file()
     state = data.get("pomo_daemon")
     if isinstance(state, dict):
         return state
@@ -225,22 +221,14 @@ def load_pomo_state() -> dict | None:
 
 
 def clear_pomo_state() -> None:
-    """
-    Remove pomodoro daemon state from .bhlib.json.
-    """
-    path = _config_path()
-    data = _load_file(path)
+    data = _load_file()
     if "pomo_daemon" in data:
         del data["pomo_daemon"]
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write(data)
 
 
 def is_pomo_running() -> bool:
-    """
-    Check if pomodoro daemon is running based on saved PID.
-    Returns True if PID exists and process is alive.
-    """
-    import os
+    """Check if pomodoro daemon is running based on saved PID."""
     import sys
 
     state = load_pomo_state()
@@ -253,7 +241,6 @@ def is_pomo_running() -> bool:
 
     try:
         if sys.platform == "win32":
-            # Windows: try to open process
             import ctypes
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.OpenProcess(0x1000, False, pid)
@@ -262,7 +249,6 @@ def is_pomo_running() -> bool:
                 return True
             return False
         else:
-            # Unix: send signal 0
             os.kill(pid, 0)
             return True
     except (OSError, ProcessLookupError, AttributeError):

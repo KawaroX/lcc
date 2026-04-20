@@ -97,11 +97,13 @@ def ensure_logged_in(
             # if token can't be decoded, just refresh
             pass
 
-    env = load_env()
-    username = (env.get("BHLIB_USERNAME") or "").strip()
-    password = env.get("BHLIB_PASSWORD") or ""
+    username = (auth.username or "").strip()
+    password = auth.password or ""
     if not username or not password:
-        raise ConfigError("需要自动登录但缺少账号密码：请在 .env 里设置 BHLIB_USERNAME/BHLIB_PASSWORD")
+        raise ConfigError(
+            "需要自动刷新 token 但缺少凭证：请运行 `bhlib login` 重新登录"
+            "（会把账号密码存到 ~/.bhlib/config.json）"
+        )
 
     result = cas_login(
         username=username,
@@ -109,11 +111,13 @@ def ensure_logged_in(
         initial_booking_cookie=auth.cookie or None,
         timeout_sec=timeout_sec,
         verify_ssl=(not insecure) and auth.verify_ssl,
-        use_proxy=use_proxy,
+        use_proxy=bool(use_proxy),
     )
     save_auth(
         token=result.token,
         cookie=result.cookie,
         base_url=auth.base_url,
         verify_ssl=(not insecure) and auth.verify_ssl,
+        username=username,
+        password=password,
     )
