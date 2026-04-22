@@ -24,6 +24,7 @@ class AuthConfig:
     base_url: str = DEFAULT_BASE_URL
     verify_ssl: bool = True
     default_area_id: str | None = None
+    seat_format: str | None = None  # "map" or "list"
     username: str | None = None
     password: str | None = None
 
@@ -130,6 +131,12 @@ def load_auth_loose() -> AuthConfig:
     verify_ssl = False if env_insecure else bool(file_data.get("verify_ssl", True))
 
     default_area_id = _pick("default_area_id", file_data=file_data, env_file=env_file) or None
+    seat_format = (
+        os.environ.get("BHLIB_SEAT_FORMAT")
+        or env_file.get("BHLIB_SEAT_FORMAT")
+        or str(file_data.get("seat_format") or "").strip()
+        or None
+    )
     username = _pick("username", file_data=file_data, env_file=env_file) or None
     password = (
         os.environ.get("BHLIB_PASSWORD")
@@ -145,16 +152,24 @@ def load_auth_loose() -> AuthConfig:
         base_url=base_url,
         verify_ssl=verify_ssl,
         default_area_id=default_area_id,
+        seat_format=seat_format,
         username=username,
         password=password,
     )
 
 
-def update_defaults(*, default_area_id: str | None = None) -> None:
+def update_defaults(
+    *, default_area_id: str | None = None, seat_format: str | None = None
+) -> None:
     """Update defaults without touching token/cookie."""
     data = _load_file()
     if default_area_id is not None:
         data["default_area_id"] = str(default_area_id).strip() or None
+    if seat_format is not None:
+        fmt = str(seat_format).strip().lower()
+        if fmt not in ("map", "list", ""):
+            raise ConfigError(f"seat_format 必须是 map 或 list，收到: {seat_format}")
+        data["seat_format"] = fmt or None
     if not data:
         raise ConfigError("配置为空：请先运行 `bhlib login`")
     _write(data)

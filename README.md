@@ -52,8 +52,10 @@ bhlib signin                     # 签到（到馆）
 bhlib leave                      # 暂离
 bhlib checkout                   # 离馆
 
-bhlib seats                      # 默认区域的空闲座位（未设默认时弹交互列表选）
-bhlib seats --area 一层西 --all  # 某区域所有状态（含已占用）
+bhlib seats                      # 默认区域的空闲座位（默认输出终端平面图）
+bhlib seats --all                # 显示全部座位状态（含已占用/已预约）
+bhlib seats --all --list         # 以列表形式输出（而非平面图）
+bhlib seats --area 一层西 --all  # 指定区域的所有状态
 
 bhlib areas                      # 所有校区/楼层/区域（树形）
 bhlib areas --flat               # 扁平：id  完整路径  free/total
@@ -70,6 +72,7 @@ bhlib pomo 25 15 60              # 25m，闪 15↔60
 bhlib pomo 25 --flash 15:60      # 同上，flag 写法
 
 bhlib config --default-area 一层西   # 设置默认区域
+bhlib config --seat-format list      # 设置 seats 默认输出为列表（默认是 map 平面图）
 ```
 
 ## 按名字指定区域

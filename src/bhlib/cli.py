@@ -1477,6 +1477,15 @@ def _cmd_pomo_daemon(args: argparse.Namespace) -> int:
 def _cmd_seats(args: argparse.Namespace) -> int:
     # Default to free-only; --all shows everything.
     args.status = [] if getattr(args, "show_all", False) else ["1"]
+    # Resolve map vs list: explicit flags win, then config default, then map.
+    has_map = getattr(args, "show_map", False)
+    has_list = getattr(args, "show_list", False)
+    if not has_map and not has_list:
+        auth = load_auth_loose()
+        if auth.seat_format == "list":
+            args.show_list = True
+        else:
+            args.show_map = True
     return _cmd_seat_list(args)
 
 
@@ -1548,7 +1557,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_seats.add_argument("--start", dest="start_time", help="开始时间 HH:MM（默认当前时间）")
     p_seats.add_argument("--end", dest="end_time", help="结束时间 HH:MM（默认 23:00）")
     p_seats.add_argument("--all", dest="show_all", action="store_true", help="显示全部座位（含已预约/占用）")
-    p_seats.add_argument("--map", dest="show_map", action="store_true", help="在终端绘制座位平面图（按状态上色）")
+    p_seats.add_argument("--map", dest="show_map", action="store_true", help="在终端绘制座位平面图（按状态上色；默认行为）")
+    p_seats.add_argument("--list", dest="show_list", action="store_true", help="以列表形式输出座位（而非平面图）")
     p_seats.add_argument("--json", action="store_true", help="输出原始 JSON")
     p_seats.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     p_seats.set_defaults(
@@ -1653,6 +1663,7 @@ def build_parser() -> argparse.ArgumentParser:
     # === config ===
     p_config = sub.add_parser("config", help="写入默认值到 ~/.bhlib/config.json（如默认区域）")
     p_config.add_argument("--default-area", dest="default_area_id", help="常用区域（id 或名字）")
+    p_config.add_argument("--seat-format", choices=["map", "list"], help="seats 命令默认输出格式（map=平面图，list=列表）")
     p_config.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     p_config.set_defaults(func=_prefs_set, insecure=False)
 
@@ -1744,13 +1755,18 @@ def _cmd_area_list(args: argparse.Namespace) -> int:
 
 
 def _prefs_set(args: argparse.Namespace) -> int:
-    if args.default_area_id is None:
-        raise ConfigError("请至少传一个字段（例如 --default-area 8）")
-    resolved = _resolve_area_id_maybe(args.default_area_id, args)
-    update_defaults(default_area_id=resolved)
-    msg = f"OK: 已更新 ~/.bhlib/config.json (default_area_id={resolved})"
-    if resolved != args.default_area_id:
-        msg += f"  ← 解析自 '{args.default_area_id}'"
+    if args.default_area_id is None and args.seat_format is None:
+        raise ConfigError("请至少传一个字段（例如 --default-area 8 或 --seat-format map）")
+    resolved = _resolve_area_id_maybe(args.default_area_id, args) if args.default_area_id is not None else None
+    update_defaults(default_area_id=resolved, seat_format=args.seat_format)
+    parts: list[str] = []
+    if resolved is not None:
+        parts.append(f"default_area_id={resolved}")
+    if args.seat_format is not None:
+        parts.append(f"seat_format={args.seat_format}")
+    msg = f"OK: 已更新 ~/.bhlib/config.json ({', '.join(parts)})"
+    if resolved is not None and resolved != args.default_area_id:
+        msg += f"  ← default_area_id 解析自 '{args.default_area_id}'"
     print(msg)
     return 0
 

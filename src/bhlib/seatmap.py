@@ -4,15 +4,14 @@ import unicodedata
 from collections import Counter, defaultdict
 from typing import NamedTuple
 
-# ANSI 8-color codes.
-# 0=black 1=red 2=green 3=yellow 4=blue 5=magenta 6=cyan 7=white 8=bright-black (grey)
+# True-color (RGB) background codes — muted pastel palette.
 _STATUS_COLOR = {
-    "1": 2,   # 空闲 -> green
-    "6": 1,   # 使用中 -> red
-    "7": 3,   # 临时离开 -> yellow
-    "2": 4,   # 已预约 -> blue
+    "1": (132, 165, 157),   # 空闲   -> #84A59D 灰绿
+    "6": (242, 132, 130),   # 使用中 -> #F28482 珊瑚粉
+    "7": (247, 237, 226),   # 临时离开 -> #F7EDE2 奶油
+    "2": (245, 202, 195),   # 已预约 -> #F5CAC3 浅桃
 }
-_DEFAULT_COLOR = 8
+_DEFAULT_COLOR = (146, 146, 146)  # 默认浅灰
 
 _STATUS_NAME = {
     "1": "空闲",
@@ -43,8 +42,12 @@ class _RegionGrid(NamedTuple):
     y_shift: int
 
 
-def _ansi_bg(code: int) -> str:
-    return f"10{code - 8}" if code >= 8 else f"4{code}"
+def _ansi_bg(code: tuple[int, int, int] | int) -> str:
+    # Support both RGB tuples (true-color) and legacy int codes.
+    if isinstance(code, tuple):
+        r, g, b = code
+        return f"48;2;{r};{g};{b}"
+    return f"48;5;{code}"
 
 
 def _fnum(v) -> float:
