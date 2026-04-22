@@ -12,6 +12,7 @@ from getpass import getpass
 from .api import post_json_authed
 from .areas import flatten_areas, get_or_fetch_tree, resolve_area_id
 from .config import (
+    CONFIG_FILE,
     ConfigError,
     clear_auth,
     cache_segment,
@@ -537,7 +538,7 @@ def _cmd_auth_set(args: argparse.Namespace) -> int:
         verify_ssl=(not args.insecure),
         default_area_id=default_area_id,
     )
-    print("OK: 已写入 ~/.bhlib/config.json")
+    print(f"OK: 已写入 {CONFIG_FILE}")
     return 0
 
 
@@ -586,7 +587,7 @@ def _cmd_auth_show(args: argparse.Namespace) -> int:
 
 def _cmd_auth_clear(args: argparse.Namespace) -> int:
     clear_auth()
-    print("OK: 已删除 ~/.bhlib/config.json")
+    print(f"OK: 已删除 {CONFIG_FILE}")
     return 0
 
 
@@ -641,7 +642,7 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         username=username,
         password=password,
     )
-    print(f"OK: 登录成功（{username}），配置已写入 ~/.bhlib/config.json")
+    print(f"OK: 登录成功（{username}），配置已写入 {CONFIG_FILE}")
     return 0
 
 
@@ -1687,7 +1688,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pomo_daemon.set_defaults(func=_cmd_pomo_daemon, insecure=False)
 
     # === config ===
-    p_config = sub.add_parser("config", help="写入默认值到 ~/.bhlib/config.json（如默认区域）")
+    p_config = sub.add_parser("config", help=f"写入默认值到 {CONFIG_FILE}（如默认区域）")
     p_config.add_argument("--default-area", dest="default_area_id", help="常用区域（id 或名字）")
     p_config.add_argument("--seat-format", choices=["map", "list"], help="seats 命令默认输出格式（map=平面图，list=列表）")
     p_config.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
@@ -1790,7 +1791,7 @@ def _prefs_set(args: argparse.Namespace) -> int:
         parts.append(f"default_area_id={resolved}")
     if args.seat_format is not None:
         parts.append(f"seat_format={args.seat_format}")
-    msg = f"OK: 已更新 ~/.bhlib/config.json ({', '.join(parts)})"
+    msg = f"OK: 已更新 {CONFIG_FILE} ({', '.join(parts)})"
     if resolved is not None and resolved != args.default_area_id:
         msg += f"  ← default_area_id 解析自 '{args.default_area_id}'"
     print(msg)

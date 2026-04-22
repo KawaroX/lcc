@@ -5,7 +5,7 @@ import datetime as _dt
 import json
 
 from .cas import cas_login
-from .config import ConfigError, load_auth_loose, save_auth
+from .config import CONFIG_FILE, ConfigError, load_auth_loose, save_auth
 from .env import load_env
 
 
@@ -102,7 +102,7 @@ def ensure_logged_in(
     if not username or not password:
         raise ConfigError(
             "需要自动刷新 token 但缺少凭证：请运行 `bhlib login` 重新登录"
-            "（会把账号密码存到 ~/.bhlib/config.json）"
+            f"（会把账号密码存到 {CONFIG_FILE}）"
         )
 
     result = cas_login(

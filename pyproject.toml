@@ -12,6 +12,8 @@ license = { text = "UNLICENSED" }
 authors = [{ name = "kawarox" }]
 dependencies = [
   "certifi>=2024.0.0",
+  "platformdirs>=4.0.0",
+  "cryptography>=39.0.0",
 ]
 
 [project.scripts]

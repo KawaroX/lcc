@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import datetime as _dt
 import json
 import subprocess
@@ -10,6 +11,14 @@ class CryptoError(RuntimeError):
 
 
 IV_STR = "ZZWBKJ_ZHIHUAWEI"
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+
+    _HAS_CRYPTOGRAPHY = True
+except Exception:  # pragma: no cover
+    _HAS_CRYPTOGRAPHY = False
 
 
 def _date_to_key_hex(day: str | None = None) -> str:
@@ -33,12 +42,57 @@ def _iv_hex() -> str:
     return IV_STR.encode("utf-8").hex()
 
 
+def _key_bytes(day: str | None = None) -> bytes:
+    return bytes.fromhex(_date_to_key_hex(day))
+
+
+def _iv_bytes() -> bytes:
+    return bytes.fromhex(_iv_hex())
+
+
+def _aesjson_encrypt_py(plaintext: bytes, *, day: str | None = None) -> str:
+    if not _HAS_CRYPTOGRAPHY:  # pragma: no cover
+        raise CryptoError("缺少 cryptography：无法进行 AES 加密")
+    key = _key_bytes(day)
+    iv = _iv_bytes()
+    padder = PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ct = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(ct).decode("utf-8")
+
+
+def _aesjson_decrypt_py(aesjson: str, *, day: str | None = None) -> bytes:
+    if not _HAS_CRYPTOGRAPHY:  # pragma: no cover
+        raise CryptoError("缺少 cryptography：无法进行 AES 解密")
+    key = _key_bytes(day)
+    iv = _iv_bytes()
+    try:
+        ct = base64.b64decode(aesjson.encode("utf-8"), validate=False)
+    except Exception as e:  # noqa: BLE001
+        raise CryptoError("aesjson 不是合法 base64") from e
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+    try:
+        unpadder = PKCS7(128).unpadder()
+        return unpadder.update(padded) + unpadder.finalize()
+    except Exception as e:  # noqa: BLE001
+        raise CryptoError("AES 解密失败（可能 day 不对）") from e
+
+
 def aesjson_encrypt(data: object, *, day: str | None = None) -> str:
     """
     Encrypt JSON.stringify(data) into base64 ciphertext string (aesjson).
-    Uses system openssl to avoid external Python deps.
+    Uses Python cryptography (cross-platform; no external openssl binary).
     """
     plaintext = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    if _HAS_CRYPTOGRAPHY:
+        return _aesjson_encrypt_py(plaintext, day=day).strip()
+
+    # Fallback (legacy): system openssl.
     key_hex = _date_to_key_hex(day)
     iv_hex = _iv_hex()
 
@@ -76,6 +130,11 @@ def aesjson_decrypt(aesjson: str, *, day: str | None = None) -> str:
     if not aesjson:
         raise CryptoError("aesjson 为空")
 
+    if _HAS_CRYPTOGRAPHY:
+        pt = _aesjson_decrypt_py(aesjson, day=day)
+        return pt.decode("utf-8", errors="replace")
+
+    # Fallback (legacy): system openssl.
     key_hex = _date_to_key_hex(day)
     iv_hex = _iv_hex()
     try:

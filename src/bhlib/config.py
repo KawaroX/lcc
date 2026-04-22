@@ -9,7 +9,22 @@ from typing import Any
 from .env import load_env
 
 DEFAULT_BASE_URL = "https://booking.lib.buaa.edu.cn"
-CONFIG_DIR = Path.home() / ".bhlib"
+
+LEGACY_CONFIG_DIR = Path.home() / ".bhlib"
+LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / "config.json"
+
+try:
+    # platformdirs picks the OS-conventional config directory:
+    # - Windows: %APPDATA%\bhlib
+    # - macOS:   ~/Library/Application Support/bhlib
+    # - Linux:   ~/.config/bhlib (or $XDG_CONFIG_HOME/bhlib)
+    from platformdirs import user_config_path as _user_config_path
+
+    CONFIG_DIR = _user_config_path("bhlib", roaming=True)
+except Exception:  # pragma: no cover
+    # Fallback for environments without platformdirs.
+    CONFIG_DIR = LEGACY_CONFIG_DIR
+
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
@@ -30,6 +45,7 @@ class AuthConfig:
 
 
 def _config_path() -> Path:
+    _maybe_migrate_legacy_config()
     return CONFIG_FILE
 
 
@@ -38,6 +54,7 @@ def _ensure_dir() -> None:
 
 
 def _write(data: dict[str, Any]) -> None:
+    _maybe_migrate_legacy_config()
     _ensure_dir()
     CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
@@ -47,12 +64,37 @@ def _write(data: dict[str, Any]) -> None:
 
 
 def _load_file() -> dict[str, Any]:
+    _maybe_migrate_legacy_config()
     try:
         return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as e:
         raise ConfigError(f"{CONFIG_FILE} 不是合法 JSON: {e}") from e
+
+
+def _maybe_migrate_legacy_config() -> None:
+    """One-time migration from legacy ~/.bhlib/config.json to the platform config dir.
+
+    This runs on both read and write paths. If the new path does not exist but the
+    legacy path does, copy the legacy file to the new location.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            return
+        if LEGACY_CONFIG_FILE.exists() and CONFIG_FILE != LEGACY_CONFIG_FILE:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(
+                LEGACY_CONFIG_FILE.read_text(encoding="utf-8", errors="replace"),
+                encoding="utf-8",
+            )
+            try:
+                os.chmod(CONFIG_FILE, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        # Best-effort only; never block normal operation.
+        return
 
 
 def save_auth(

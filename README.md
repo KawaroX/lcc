@@ -5,7 +5,7 @@
 ## 免责声明
 
 - 请确保你的使用符合学校/图书馆的服务条款与相关规定。
-- `token` / `cookie` / 账号密码存在 `~/.bhlib/config.json`（权限 0600），请勿泄露。
+- `token` / `cookie` / 账号密码存在用户配置目录下的 `bhlib/config.json`（会尝试设为权限 0600），请勿泄露。
 
 ## 安装
 
@@ -19,9 +19,8 @@ pipx install git+https://github.com/KawaroX/bhlib.git
 
 > Windows 备注：
 >
-> - 配置文件路径是 `Path.home()/.bhlib/config.json`，Windows 上通常会保存到 `C:\Users\<用户名>\.bhlib\config.json`（文档里的 `~` 只是“家目录”的习惯写法）。
+> - 配置文件默认在 `%APPDATA%\\bhlib\\config.json`（例如 `C:\\Users\\<用户名>\\AppData\\Roaming\\bhlib\\config.json`）。
 > - 会尝试把配置文件权限设为 `0600`（`chmod`），但 Windows 上可能不生效；不影响运行，只是权限语义不同。
-> - AES 加解密依赖系统 `openssl`（不少命令都会用到，不仅是 `pomo`）。Windows 默认没有：安装 Git for Windows（自带）或 [Win64 OpenSSL](https://slproweb.com/products/Win32OpenSSL.html)，并确保命令行能直接运行 `openssl`（在 PATH 里）。
 > - `seats` 的平面图输出使用 ANSI 颜色；如果显示异常可用 `bhlib seats --list` 或 `bhlib config --seat-format list`。
 
 升级 / 卸载：
@@ -37,7 +36,7 @@ pipx uninstall bhlib
 bhlib login
 # 学号: ********
 # 密码: ********
-# OK: 登录成功，配置已写入 ~/.bhlib/config.json
+# OK: 登录成功，配置已写入 <config path>
 ```
 
 之后**从任何目录**跑 `bhlib` 都能用。token 到期时会用保存的账号密码自动续约，不需要任何 `.env` 或环境变量。
@@ -181,7 +180,7 @@ bhlib --insecure login           # 这次跳过证书校验
 
 ## 安全提示
 
-- `~/.bhlib/config.json` 里是明文的账号密码 + token。
+- 配置文件 `bhlib/config.json` 里是明文的账号密码 + token（具体路径取决于系统）。
 - Token 是 JWT，包含学号、姓名等个人信息；贴抓包/日志时请脱敏。
 - 怀疑泄露了 token，重新 `bhlib login` 会让旧 token 作废；必要时修改 SSO 密码。
 

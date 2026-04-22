@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .auth import load_auth_loose
-from .config import ConfigError, _config_path
+from .config import CONFIG_DIR, ConfigError, _config_path
 from .cli import _fetch_subscribe, _pick_my_light_device, _set_light_brightness_by_ids
 
 
@@ -173,7 +173,7 @@ def start_daemon(
         kwargs['start_new_session'] = True
 
     # 重定向输出到日志文件或空设备
-    log_file = Path.home() / '.bhlib' / 'pomo.log'
+    log_file = CONFIG_DIR / 'pomo.log'
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     with open(log_file, 'a') as f:
@@ -237,7 +237,7 @@ def ensure_single_instance(lockfile: Optional[Path] = None) -> bool:
     返回: True 如果这是唯一实例，False 如果已有实例在运行
     """
     if lockfile is None:
-        lockfile = Path.home() / '.bhlib' / 'pomo.lock'
+        lockfile = CONFIG_DIR / 'pomo.lock'
 
     lockfile.parent.mkdir(parents=True, exist_ok=True)
 
@@ -271,7 +271,7 @@ def ensure_single_instance(lockfile: Optional[Path] = None) -> bool:
 def cleanup_lockfile(lockfile: Optional[Path] = None) -> None:
     """清理锁文件（如果属于当前进程）。"""
     if lockfile is None:
-        lockfile = Path.home() / '.bhlib' / 'pomo.lock'
+        lockfile = CONFIG_DIR / 'pomo.lock'
 
     try:
         if lockfile.exists():
