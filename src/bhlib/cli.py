@@ -4,6 +4,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import sys
 import time
 from getpass import getpass
@@ -25,6 +26,37 @@ from .crypto import CryptoError, aesjson_decrypt, aesjson_encrypt
 from .http import HttpError
 from .env import load_env
 from .seatmap import render_seat_map
+
+
+def _normalize_day_yyyy_mm_dd(v: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        raise ConfigError("日期不能为空（应为 YYYY-MM-DD，例如 2026-04-21）")
+    if s.isdigit() and len(s) == 8:
+        s = f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    try:
+        _dt.date.fromisoformat(s)
+    except ValueError as e:
+        raise ConfigError(f"日期格式错误：{v}（应为 YYYY-MM-DD，例如 2026-04-21）") from e
+    return s
+
+
+def _normalize_time_hh_mm(v: str, *, flag: str) -> str:
+    s = str(v or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if not m:
+        raise ConfigError(f"{flag} 时间格式错误：{v}（应为 HH:MM，例如 07:00）")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ConfigError(f"{flag} 时间超出范围：{v}（应为 00:00-23:59）")
+    return f"{hh:02d}:{mm:02d}"
+
+
+def _time_hh_mm_to_minutes(v: str) -> int:
+    # v must already be normalized HH:MM.
+    hh, mm = v.split(":", 1)
+    return int(hh) * 60 + int(mm)
 
 
 def _effective_verify_ssl(auth, args: argparse.Namespace) -> bool:
@@ -745,7 +777,7 @@ def _cmd_pomo_start(args: argparse.Namespace) -> int:
     else:
         total_sec = float(args.minutes) * 60.0
     if total_sec <= 0:
-        raise ConfigError("番茄钟时长必须为正数（--minutes/--seconds）")
+        raise ConfigError("番茄钟时长必须为正数（duration，如 25 / 25m / 1h）")
 
     end_at = _dt.datetime.now() + _dt.timedelta(seconds=total_sec)
     print(f"Pomodoro 开始：{total_sec:.0f}s，预计结束时间：{end_at.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -932,16 +964,21 @@ def _cmd_space_book(args: argparse.Namespace) -> int:
     verify_ssl = _effective_verify_ssl(auth, args)
     env = load_env()
 
-    day = args.day or _dt.date.today().isoformat()
-    end_time = args.end_time or "23:00"
-    start_time = args.start_time or _dt.datetime.now().strftime("%H:%M")
+    day = _normalize_day_yyyy_mm_dd(args.day) if args.day else _dt.date.today().isoformat()
+    start_time = _normalize_time_hh_mm(
+        (args.start_time or _dt.datetime.now().strftime("%H:%M")),
+        flag="--start",
+    )
+    end_time = _normalize_time_hh_mm((args.end_time or "23:00"), flag="--end")
 
     area_id = _resolve_area_id_maybe(args.area_id, args, auth=auth) or auth.default_area_id
     if not area_id:
         area_id = _interactive_pick_area(args, auth)
 
-    if start_time >= end_time:
-        raise ConfigError(f"时间区间无效：start_time={start_time} end_time={end_time}")
+    if _time_hh_mm_to_minutes(start_time) >= _time_hh_mm_to_minutes(end_time):
+        raise ConfigError(
+            f"时间区间无效：start_time={start_time} end_time={end_time}（请检查 --start/--end；格式 HH:MM，例如 --start 07:00 --end 23:00；日期用 --day YYYY-MM-DD）"
+        )
 
     # Fetch seat list (for both display and segment discovery).
     seat_resp = _fetch_seat_resp(
@@ -1131,9 +1168,12 @@ def _cmd_space_book(args: argparse.Namespace) -> int:
 def _cmd_seat_list(args: argparse.Namespace) -> int:
     auth = load_auth_loose()
     verify_ssl = _effective_verify_ssl(auth, args)
-    day = args.day or _dt.date.today().isoformat()
-    end_time = args.end_time or "23:00"
-    start_time = args.start_time or _dt.datetime.now().strftime("%H:%M")
+    day = _normalize_day_yyyy_mm_dd(args.day) if args.day else _dt.date.today().isoformat()
+    start_time = _normalize_time_hh_mm(
+        (args.start_time or _dt.datetime.now().strftime("%H:%M")),
+        flag="--start",
+    )
+    end_time = _normalize_time_hh_mm((args.end_time or "23:00"), flag="--end")
 
     area_id = _resolve_area_id_maybe(args.area_id, args, auth=auth)
     if not area_id:
@@ -1145,8 +1185,10 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
     if not area_id:
         area_id = _interactive_pick_area(args, auth)
 
-    if (args.start_time is None) and (args.end_time is None) and start_time >= end_time:
-        raise ConfigError(f"默认时间区间无效：start_time={start_time} end_time={end_time}（请手动指定 --start-time/--end-time 或 --day）")
+    if (args.start_time is None) and (args.end_time is None) and _time_hh_mm_to_minutes(start_time) >= _time_hh_mm_to_minutes(end_time):
+        raise ConfigError(
+            f"默认时间区间无效：start_time={start_time} end_time={end_time}（当前时间已晚于默认 --end 23:00；请手动指定 --start/--end，格式 HH:MM；日期用 --day YYYY-MM-DD，例如 --day 2026-04-21）"
+        )
 
     payload = {
         "id": str(area_id),
@@ -1470,8 +1512,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_book.add_argument("seat", nargs="?", help="座位号（默认按 no；配合 --id 则为座位 id）")
     p_book.add_argument("--id", dest="by_id", action="store_true", help="把 seat 解释为座位 id 而不是座位号")
     p_book.add_argument("--area", dest="area_id", help="区域（id 或名字，模糊匹配）")
-    p_book.add_argument("--day", help="日期 YYYY-MM-DD（默认今天）")
+    p_book.add_argument("--day", help="日期 YYYY-MM-DD（也支持 YYYYMMDD；默认今天）")
     p_book.add_argument("--start", dest="start_time", help="开始时间 HH:MM（默认当前时间）")
+    p_book.add_argument("--segment", help=argparse.SUPPRESS)
     p_book.add_argument("--all", action="store_true", help="展示所有座位（默认仅空闲）")
     p_book.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
     p_book.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
@@ -1501,7 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
     # === seats ===
     p_seats = sub.add_parser("seats", help="查询空位（默认仅空闲；--all 显示全部）")
     p_seats.add_argument("--area", dest="area_id", help="区域（id 或名字）")
-    p_seats.add_argument("--day", help="日期 YYYY-MM-DD（默认今天）")
+    p_seats.add_argument("--day", help="日期 YYYY-MM-DD（也支持 YYYYMMDD；默认今天）")
     p_seats.add_argument("--start", dest="start_time", help="开始时间 HH:MM（默认当前时间）")
     p_seats.add_argument("--end", dest="end_time", help="结束时间 HH:MM（默认 23:00）")
     p_seats.add_argument("--all", dest="show_all", action="store_true", help="显示全部座位（含已预约/占用）")
@@ -1530,6 +1573,8 @@ def build_parser() -> argparse.ArgumentParser:
     # === light ===
     p_light = sub.add_parser("light", help="设置阅读灯亮度（on=20, off=0, 或传 0-100）")
     p_light.add_argument("value", help="on / off / 0-100")
+    p_light.add_argument("--device-id", dest="device_id", help=argparse.SUPPRESS)
+    p_light.add_argument("--area-id", dest="area_id", help=argparse.SUPPRESS)
     p_light.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     p_light.set_defaults(
         func=_cmd_light,
@@ -1700,7 +1745,7 @@ def _cmd_area_list(args: argparse.Namespace) -> int:
 
 def _prefs_set(args: argparse.Namespace) -> int:
     if args.default_area_id is None:
-        raise ConfigError("请至少传一个字段（例如 --default-area-id 8）")
+        raise ConfigError("请至少传一个字段（例如 --default-area 8）")
     resolved = _resolve_area_id_maybe(args.default_area_id, args)
     update_defaults(default_area_id=resolved)
     msg = f"OK: 已更新 ~/.bhlib/config.json (default_area_id={resolved})"

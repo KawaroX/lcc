@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter
+import unicodedata
+from collections import Counter, defaultdict
+from typing import NamedTuple
 
 # ANSI 8-color codes.
 # 0=black 1=red 2=green 3=yellow 4=blue 5=magenta 6=cyan 7=white 8=bright-black (grey)
@@ -19,17 +21,26 @@ _STATUS_NAME = {
     "2": "已预约",
 }
 
-# Rendering parameters.
-CELL_W = 3                 # each seat is a 3-char cell
-STRIDE_X = CELL_W + 1      # 1-char gap between adjacent grid columns
+CELL_W = 3
+STRIDE_X = CELL_W + 1
 
-# Clustering thresholds in coordinate units. Seats whose x / y differ by less
-# than the threshold share a grid column / row. Chosen so that:
-#   - sub-pixel jitter inside a single seat "table" collapses to one row,
-#   - distinct table rows (~3 units apart vertically) stay separate,
-#   - adjacent seat columns (~1.5 units apart horizontally) stay separate.
 X_CLUSTER = 0.6
 Y_CLUSTER = 0.5
+
+# Y-gap between consecutive y-clusters. Below this we treat them as a "glued
+# pair" (no blank line between); at or above this they are separate (blank
+# line between). Tuned for this library: within-pair ~3.5, between-group >=5.
+GLUE_Y_GAP = 4.5
+
+# Horizontal separator between regions in the composed output.
+REGION_SEP = "    "
+
+
+class _RegionGrid(NamedTuple):
+    rows: list[tuple[list[str], list[int | None]] | None]
+    width: int
+    x_shift: int
+    y_shift: int
 
 
 def _ansi_bg(code: int) -> str:
@@ -53,140 +64,35 @@ def _seat_label(no: str, cell_w: int) -> str:
     return (n[:cell_w]).ljust(cell_w)
 
 
-def _cluster(values: list[float], threshold: float) -> dict[float, int]:
-    """Greedy 1-D clustering: consecutive values within `threshold` share an index."""
+def _cluster(values: list[float], threshold: float) -> tuple[dict[float, int], list[float]]:
+    """Greedy 1-D clustering. Returns (index_of_value, cluster_centers)."""
     if not values:
-        return {}
+        return {}, []
     uniq = sorted(set(values))
     index_of: dict[float, int] = {}
-    cur = 0
     groups: list[list[float]] = [[uniq[0]]]
     index_of[uniq[0]] = 0
     for v in uniq[1:]:
         if v - groups[-1][-1] < threshold:
             groups[-1].append(v)
+            index_of[v] = len(groups) - 1
         else:
-            cur += 1
             groups.append([v])
-        index_of[v] = cur
-    return index_of
+            index_of[v] = len(groups) - 1
+    centers = [sum(g) / len(g) for g in groups]
+    return index_of, centers
 
 
-def render_seat_map(
-    seats: list[dict],
-    *,
-    compress_blank_rows: bool = True,
-) -> str:
-    """Render a cluster-aligned seat map. Each seat is a 3-char colored cell."""
-    if not seats:
-        return "(no seats)"
-
-    geom: list[tuple[float, float, str, str]] = []
-    for s in seats:
-        x = _fnum(s.get("point_x"))
-        y = _fnum(s.get("point_y"))
-        status = str(s.get("status") or "")
-        no = str(s.get("no") or "")
-        geom.append((x, y, status, no))
-
-    if not geom:
-        return "(no seats with geometry)"
-
-    area_name = ""
-    for s in seats:
-        n = str(s.get("area_name") or "").strip()
-        if n:
-            area_name = n
-            break
-
-    x_index = _cluster([g[0] for g in geom], X_CLUSTER)
-    y_index = _cluster([g[1] for g in geom], Y_CLUSTER)
-
-    num_gx = (max(x_index.values()) + 1) if x_index else 1
-    num_gy = (max(y_index.values()) + 1) if y_index else 1
-
-    cols = num_gx * STRIDE_X
-    # Extra rows in case two seats share the exact same (gx, gy) and need to stack.
-    rows = num_gy + 4
-
-    char_grid: list[list[str]] = [[" "] * cols for _ in range(rows)]
-    color_grid: list[list[int | None]] = [[None] * cols for _ in range(rows)]
-
-    # Stable order: lower numbers drawn first. Same-cell collisions bump the
-    # later (higher-numbered) seat down.
-    geom_sorted = sorted(
-        geom, key=lambda g: (int(g[3]) if g[3].isdigit() else 10**9, g[3])
-    )
-    status_counts: Counter = Counter()
-
-    for x, y, status, no in geom_sorted:
-        gx = x_index[x]
-        gy = y_index[y]
-        color = _STATUS_COLOR.get(status, _DEFAULT_COLOR)
-        label = _seat_label(no, CELL_W)
-        start = gx * STRIDE_X
-        gy_try = gy
-        while gy_try < rows:
-            occupied = any(
-                color_grid[gy_try][start + i] is not None
-                for i in range(CELL_W)
-                if 0 <= start + i < cols
-            )
-            if not occupied:
-                break
-            gy_try += 1
-        if gy_try >= rows:
-            continue
-        for i, ch in enumerate(label):
-            cx = start + i
-            if 0 <= cx < cols:
-                char_grid[gy_try][cx] = ch
-                color_grid[gy_try][cx] = color
-        status_counts[status] += 1
-
-    has_content = [any(c is not None for c in color_grid[r]) for r in range(rows)]
-
-    out_lines: list[str] = []
-    blank_allowed = True
-    for r in range(rows):
-        if has_content[r]:
-            out_lines.append(_render_row(color_grid[r], char_grid[r], cols))
-            blank_allowed = True
-        else:
-            if compress_blank_rows:
-                if blank_allowed and any(has_content[r + 1 :]):
-                    out_lines.append("")
-                    blank_allowed = False
-            else:
-                out_lines.append("")
-
-    while out_lines and not out_lines[0].strip():
-        out_lines.pop(0)
-    while out_lines and not out_lines[-1].strip():
-        out_lines.pop()
-
-    reset = "\x1b[0m"
-    legend_bits: list[str] = []
-    for st in ("1", "2", "6", "7"):
-        cnt = status_counts.get(st, 0)
-        if cnt <= 0:
-            continue
-        color = _STATUS_COLOR.get(st, _DEFAULT_COLOR)
-        name = _STATUS_NAME.get(st, f"status={st}")
-        legend_bits.append(f"\x1b[30;{_ansi_bg(color)}m   {reset} {name} × {cnt}")
-    for st, cnt in status_counts.items():
-        if st in ("1", "2", "6", "7") or cnt <= 0:
-            continue
-        color = _STATUS_COLOR.get(st, _DEFAULT_COLOR)
-        name = _STATUS_NAME.get(st, f"status={st}")
-        legend_bits.append(f"\x1b[30;{_ansi_bg(color)}m   {reset} {name} × {cnt}")
-    legend = "  ".join(legend_bits)
-
-    title = area_name if area_name else "座位图"
-    parts = [title] + out_lines
-    if legend:
-        parts.append(legend)
-    return "\n".join(parts)
+def _region_of(no_int: int) -> str | None:
+    if 1 <= no_int <= 26:
+        return "A"
+    if 27 <= no_int <= 72:
+        return "B"
+    if 73 <= no_int <= 100:
+        return "C"
+    if 101 <= no_int <= 175:
+        return "D"
+    return None
 
 
 def _render_row(color_row: list, char_row: list, cols: int) -> str:
@@ -209,3 +115,459 @@ def _render_row(color_row: list, char_row: list, cols: int) -> str:
     if last_color is not None:
         buf.append(reset)
     return "".join(buf).rstrip()
+
+
+def _visible_width(s: str) -> int:
+    out = 0
+    i = 0
+    in_esc = False
+    while i < len(s):
+        ch = s[i]
+        if ch == "\x1b":
+            in_esc = True
+            i += 1
+            continue
+        if in_esc:
+            if ch == "m":
+                in_esc = False
+            i += 1
+            continue
+        out += 1
+        i += 1
+    return out
+
+
+def _terminal_width(s: str) -> int:
+    """Visible width counting CJK chars as 2 cols; skips ANSI escape sequences."""
+    out = 0
+    i = 0
+    in_esc = False
+    while i < len(s):
+        ch = s[i]
+        if ch == "\x1b":
+            in_esc = True
+            i += 1
+            continue
+        if in_esc:
+            if ch == "m":
+                in_esc = False
+            i += 1
+            continue
+        out += 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+        i += 1
+    return out
+
+
+def _pad_visible(s: str, width: int) -> str:
+    pad = width - _visible_width(s)
+    if pad > 0:
+        return s + " " * pad
+    return s
+
+
+def _render_region(
+    seats: list[tuple[int, float, float, str]],
+    counts: Counter,
+    region_x_idx: dict[float, int] | None = None,
+    *,
+    region_cols: int | None = None,
+    region_right_align: bool = False,
+) -> tuple[list[tuple[list[str], list[int | None]] | None], int]:
+    """Render a region into rows of (char_row, color_row). Returns (rows, width).
+
+    Algorithm: y-cluster -> form glued-groups (consecutive clusters with gap
+    < GLUE_Y_GAP). Each group x-clusters independently and flattens seats
+    into collision-bumped stacks, so rows with complementary x (e.g.
+    165-175 bottom row split across two y values) merge into one line.
+
+    When *region_x_idx* is provided, all groups in the region share the same
+    x-coordinate mapping. This is useful for regions like C and D where
+    different glued groups occupy the same physical x-columns and should
+    align vertically.
+    """
+    if not seats:
+        return [], 0
+
+    ys = [s[2] for s in seats]
+    y_idx, y_centers = _cluster(ys, Y_CLUSTER)
+
+    by_y: dict[int, list[tuple[int, float, str]]] = defaultdict(list)
+    for no, x, y, status in seats:
+        by_y[y_idx[y]].append((no, x, status))
+
+    y_order = sorted(by_y.keys(), key=lambda k: y_centers[k])
+
+    # Partition y-clusters into glued groups. A cluster joins the current
+    # group when gap < GLUE_Y_GAP. Additionally, once the current group
+    # already holds 2 multi-seat clusters (one glued table pair), a new
+    # multi-seat cluster starts a fresh group — this separates the 165-175
+    # bottom strip from the 153-164 pair. Single-seat clusters (e.g. the
+    # 1-26 column) don't count toward the cap, so the left column stays
+    # tight without artificial breaks.
+    def _is_multi(yk: int) -> bool:
+        return len(by_y[yk]) >= 2
+
+    groups: list[list[int]] = [[y_order[0]]]
+    for i in range(1, len(y_order)):
+        gap = y_centers[y_order[i]] - y_centers[y_order[i - 1]]
+        yk = y_order[i]
+        multi_in_group = sum(1 for k in groups[-1] if _is_multi(k))
+        if gap >= GLUE_Y_GAP:
+            groups.append([yk])
+        elif _is_multi(yk) and multi_in_group >= 2:
+            groups.append([yk])
+        else:
+            groups[-1].append(yk)
+
+    # Fixed width for region-wide mode (optional).
+    fixed_cols = region_cols if (region_x_idx is not None and region_cols is not None) else None
+
+    rows: list[tuple[list[str], list[int | None]] | None] = []
+    for gi, group in enumerate(groups):
+        if gi > 0:
+            rows.append(None)
+
+        group_seats: list[tuple[int, float, str]] = []
+        for yk in group:
+            group_seats.extend(by_y[yk])
+
+        if region_x_idx is not None:
+            x_idx = region_x_idx
+            if fixed_cols is not None:
+                cols = fixed_cols
+            else:
+                num_gx = (max(x_idx.values()) + 1) if x_idx else 1
+                cols = num_gx * STRIDE_X
+        else:
+            group_xs = [s[1] for s in group_seats]
+            x_idx, _ = _cluster(group_xs, X_CLUSTER)
+            num_gx = (max(x_idx.values()) + 1) if x_idx else 1
+            cols = num_gx * STRIDE_X
+
+        # Each y-cluster becomes its own stack, in y order. This preserves
+        # the row structure (top row vs bottom row of a glued pair).
+        stacks: list[list[tuple[int, int, str]]] = []
+        for yk in group:
+            stack: list[tuple[int, int, str]] = []
+            for no, x, status in sorted(by_y[yk], key=lambda s: x_idx[s[1]]):
+                gx = x_idx[x]
+                if any(other_gx == gx for other_gx, _, _ in stack):
+                    stacks.append(stack)
+                    stack = []
+                stack.append((gx, no, status))
+            if stack:
+                stacks.append(stack)
+
+        # Merge adjacent stacks if their x-columns are fully disjoint, so a
+        # row split only by y-jitter (e.g. 167-168 at y=89 vs the rest of
+        # 165-175 at y=93) renders as one line.
+        merged = True
+        while merged and len(stacks) >= 2:
+            merged = False
+            for i in range(len(stacks) - 1):
+                cols_a = {gx for gx, _, _ in stacks[i]}
+                cols_b = {gx for gx, _, _ in stacks[i + 1]}
+                if cols_a.isdisjoint(cols_b):
+                    stacks[i] = sorted(stacks[i] + stacks[i + 1], key=lambda c: c[0])
+                    del stacks[i + 1]
+                    merged = True
+                    break
+
+        for stack in stacks:
+            char_row = [" "] * cols
+            color_row: list[int | None] = [None] * cols
+            max_gx = max(gx for gx, _, _ in stack) if stack else 0
+            start_offset = 0
+            if region_x_idx is not None and region_right_align:
+                row_right = max_gx * STRIDE_X + CELL_W
+                indent = cols - row_right
+                start_offset = max(0, indent)
+            for gx, no, status in stack:
+                color = _STATUS_COLOR.get(status, _DEFAULT_COLOR)
+                label = _seat_label(str(no).zfill(3), CELL_W)
+                start = start_offset + gx * STRIDE_X
+                for i, ch in enumerate(label):
+                    cx = start + i
+                    if 0 <= cx < cols:
+                        char_row[cx] = ch
+                        color_row[cx] = color
+                counts[status] += 1
+            rows.append((char_row, color_row))
+
+    def _row_used_width(rr: tuple[list[str], list[int | None]]) -> int:
+        chars, colors = rr
+        for i in range(len(chars) - 1, -1, -1):
+            if colors[i] is not None or chars[i] != " ":
+                return i + 1
+        return 0
+
+    width = max((_row_used_width(r) for r in rows if r is not None), default=0)
+    if width > 0:
+        for i, rr in enumerate(rows):
+            if rr is None:
+                continue
+            chars, colors = rr
+            if len(chars) > width:
+                rows[i] = (chars[:width], colors[:width])
+    return rows, width
+
+
+def render_seat_map(
+    seats: list[dict],
+    *,
+    compress_blank_rows: bool = True,
+) -> str:
+    if not seats:
+        return "(no seats)"
+
+    area_name = ""
+    for s in seats:
+        n = str(s.get("area_name") or "").strip()
+        if n:
+            area_name = n
+            break
+
+    geoms: list[tuple[int, float, float, str]] = []
+    misfits: list[tuple[int, float, float, str]] = []
+    for s in seats:
+        no_raw = str(s.get("no") or "").strip()
+        try:
+            no_int = int(no_raw)
+        except ValueError:
+            continue
+        x = _fnum(s.get("point_x"))
+        y = _fnum(s.get("point_y"))
+        status = str(s.get("status") or "")
+        row = (no_int, x, y, status)
+        if _region_of(no_int) is None:
+            misfits.append(row)
+        else:
+            geoms.append(row)
+
+    if not geoms and not misfits:
+        return "(no seats with geometry)"
+
+    regions: dict[str, list[tuple[int, float, float, str]]] = {
+        "A": [],
+        "B": [],
+        "C": [],
+        "D": [],
+    }
+    for g in geoms:
+        regions[_region_of(g[0])].append(g)  # type: ignore[index]
+
+    counts: Counter = Counter()
+    grids: dict[str, _RegionGrid] = {}
+
+    # Region A first — its height anchors the bottom alignment for B and D.
+    a_rows, a_width = _render_region(regions["A"], counts, region_x_idx=None)
+    grids["A"] = _RegionGrid(rows=a_rows, width=a_width, x_shift=0, y_shift=0)
+    a_height = len(a_rows)
+
+    # Region D: shared x-cluster + right-align (175 under 164), and shift the
+    # whole region left by the empty leading columns before seat 101 so that
+    # "76    101" spacing stays normal. Then push it down so its bottom row
+    # lands on A's last row.
+    if regions["D"]:
+        xs = [g[1] for g in regions["D"]]
+        region_x_idx, _ = _cluster(xs, X_CLUSTER)
+
+        main_gxs: list[int] = []
+        for no, x, _y, _st in regions["D"]:
+            if 101 <= no <= 164:
+                gx = region_x_idx.get(x)
+                if gx is not None:
+                    main_gxs.append(gx)
+        if main_gxs:
+            anchor_gx = min(main_gxs)
+            target_max_gx = max(main_gxs)
+            d_cols = target_max_gx * STRIDE_X + CELL_W
+            d_x_shift = -(anchor_gx * STRIDE_X)
+            d_rows, d_width = _render_region(
+                regions["D"],
+                counts,
+                region_x_idx=region_x_idx,
+                region_cols=d_cols,
+                region_right_align=True,
+            )
+        else:
+            d_rows, d_width = _render_region(regions["D"], counts, region_x_idx=None)
+            d_x_shift = 0
+    else:
+        d_rows, d_width, d_x_shift = [], 0, 0
+
+    d_y_shift = max(0, a_height - len(d_rows)) if d_rows else 0
+    grids["D"] = _RegionGrid(rows=d_rows, width=d_width, x_shift=d_x_shift, y_shift=d_y_shift)
+
+    # B/C share D's baseline shift, plus 2 to align "31.."/"73.." with D's
+    # "107.." row (D's first visible row "101..106" sits one separator above).
+    bc_y_shift = d_y_shift + 2
+
+    # Region B: render with per-group x-clustering. If the detached "27-30"
+    # row is present, pad before it so it lands on A's last row (alongside
+    # D's bottom row 165..175).
+    b_rows, b_width = _render_region(regions["B"], counts, region_x_idx=None)
+    if (
+        b_rows
+        and a_height > 0
+        and any(s[0] in (27, 28, 29, 30) for s in regions["B"])
+    ):
+        last_idx = next(
+            (i for i in range(len(b_rows) - 1, -1, -1) if b_rows[i] is not None),
+            None,
+        )
+        if last_idx is not None:
+            pad = (a_height - 1) - (bc_y_shift + last_idx)
+            if pad > 0:
+                b_rows = b_rows[:last_idx] + [None] * pad + b_rows[last_idx:]
+    grids["B"] = _RegionGrid(rows=b_rows, width=b_width, x_shift=0, y_shift=bc_y_shift)
+
+    # Region C: same baseline as B.
+    c_rows, c_width = _render_region(regions["C"], counts, region_x_idx=None)
+    grids["C"] = _RegionGrid(rows=c_rows, width=c_width, x_shift=0, y_shift=bc_y_shift)
+
+    active = [name for name in ("A", "B", "C", "D") if grids[name].rows]
+    if not active:
+        return "(no seats with geometry)"
+
+    height = max((len(grids[n].rows) + grids[n].y_shift) for n in active)
+    composed: list[str] = []
+
+    # Compute base x offsets for each region (without shifts).
+    offsets: dict[str, int] = {}
+    x = 0
+    for i, n in enumerate(active):
+        offsets[n] = x
+        x += grids[n].width
+        if i != len(active) - 1:
+            x += len(REGION_SEP)
+    base_total_cols = x
+
+    # If shifts push content left of 0 (e.g. only Region D active), add a left pad.
+    min_col = 0
+    for n in active:
+        min_col = min(min_col, offsets[n] + grids[n].x_shift)
+    left_pad = -min_col if min_col < 0 else 0
+    total_cols = base_total_cols + left_pad
+
+    # Visible right edge of the rendered map: when D is shifted left by its
+    # leading empty columns, the trailing empty columns inside base_total_cols
+    # never get content. Use the actual extent for centering the legend.
+    visible_right = max(
+        (offsets[n] + grids[n].x_shift + grids[n].width for n in active),
+        default=total_cols,
+    ) + left_pad
+
+    for r in range(height):
+        char_row = [" "] * total_cols
+        color_row: list[int | None] = [None] * total_cols
+
+        any_content = False
+        for n in active:
+            grid = grids[n]
+            rr_idx = r - grid.y_shift
+            rr = grid.rows[rr_idx] if 0 <= rr_idx < len(grid.rows) else None
+            if rr is None:
+                continue
+            src_chars, src_colors = rr
+            base = offsets[n] + grid.x_shift + left_pad
+            for i in range(min(len(src_chars), len(src_colors))):
+                ch = src_chars[i]
+                col = base + i
+                if col < 0 or col >= total_cols:
+                    continue
+                color = src_colors[i]
+                if color is None and ch == " ":
+                    continue
+                if color_row[col] is None and char_row[col] == " ":
+                    char_row[col] = ch
+                    color_row[col] = color
+                    any_content = True
+        if not any_content:
+            composed.append("")
+        else:
+            composed.append(_render_row(color_row, char_row, total_cols))
+
+    # Any stray seats not matched by region rules: append as extra lines below.
+    if misfits:
+        extra_rows, extra_w = _render_region(misfits, counts)
+        if extra_rows:
+            composed.append("")
+            for rr in extra_rows:
+                if rr is None:
+                    composed.append("")
+                    continue
+                chars, colors = rr
+                if not any(c is not None for c in colors) and not any(ch != " " for ch in chars):
+                    composed.append("")
+                else:
+                    composed.append(_render_row(colors, chars, len(chars)))
+
+    reset = "\x1b[0m"
+    legend_specs: list[tuple[int, str]] = []
+    for st in ("1", "2", "6", "7"):
+        cnt = counts.get(st, 0)
+        if cnt <= 0:
+            continue
+        color = _STATUS_COLOR.get(st, _DEFAULT_COLOR)
+        name = _STATUS_NAME.get(st, f"status={st}")
+        legend_specs.append((color, f"{name} × {cnt}"))
+    for st, cnt in counts.items():
+        if st in ("1", "2", "6", "7") or cnt <= 0:
+            continue
+        color = _STATUS_COLOR.get(st, _DEFAULT_COLOR)
+        name = _STATUS_NAME.get(st, f"status={st}")
+        legend_specs.append((color, f"{name} × {cnt}"))
+
+    # Try to inject the legend as a 2-row block (color blocks above labels),
+    # horizontally centered within the empty area to the right of A.
+    injected = False
+    if legend_specs and a_height > 5:
+        item_widths = [max(3, _terminal_width(label)) for _, label in legend_specs]
+        spacing = 3
+        block_w = sum(item_widths) + spacing * (len(legend_specs) - 1)
+        left_bound = a_width + len(REGION_SEP)
+        avail = visible_right - left_bound
+        top_idx = (8 - 2) // 2  # vertically centered in the 8-row top band
+        if avail >= block_w and top_idx + 1 < len(composed):
+            indent = left_bound + (avail - block_w) // 2
+            blocks_parts: list[str] = []
+            labels_parts: list[str] = []
+            for i, (color, label) in enumerate(legend_specs):
+                item_w = item_widths[i]
+                block = f"\x1b[30;{_ansi_bg(color)}m   {reset}"
+                bp_l = (item_w - 3) // 2
+                blocks_parts.append(" " * bp_l + block + " " * (item_w - 3 - bp_l))
+                lw = _terminal_width(label)
+                lp_l = (item_w - lw) // 2
+                labels_parts.append(" " * lp_l + label + " " * (item_w - lw - lp_l))
+            sep = " " * spacing
+            row_blocks = sep.join(blocks_parts)
+            row_labels = sep.join(labels_parts)
+            top_existing = composed[top_idx]
+            bot_existing = composed[top_idx + 1]
+            if (
+                _terminal_width(top_existing) <= indent
+                and _terminal_width(bot_existing) <= indent
+            ):
+                composed[top_idx] = (
+                    top_existing
+                    + " " * (indent - _terminal_width(top_existing))
+                    + row_blocks
+                )
+                composed[top_idx + 1] = (
+                    bot_existing
+                    + " " * (indent - _terminal_width(bot_existing))
+                    + row_labels
+                )
+                injected = True
+
+    title = area_name if area_name else "座位图"
+    parts = [title] + composed
+    if legend_specs and not injected:
+        legend_line = "  ".join(
+            f"\x1b[30;{_ansi_bg(c)}m   {reset} {l}" for c, l in legend_specs
+        )
+        parts.append("")
+        parts.append(legend_line)
+    return "\n".join(parts)
