@@ -1270,6 +1270,12 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
     seg_part = f" segment={segment}" if segment else ""
     print(f"area_id={area_id} day={day} {start_time}-{end_time}{seg_part} seats={len(rows)}")
     if getattr(args, "show_map", False):
+        if getattr(args, "image", False):
+            from .seatmap import render_seat_map_to_image
+
+            img_path = render_seat_map_to_image(rows, path=getattr(args, "image_path", None))
+            print(f"image={img_path}")
+            return 0
         print(render_seat_map(rows))
         return 0
     print(f"{'id':>7}  {'no':>4}  {'status':>6}  status_name")
@@ -1587,6 +1593,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_seats.add_argument("--map", dest="show_map", action="store_true", help="在终端绘制座位平面图（按状态上色；默认行为）")
     p_seats.add_argument("--list", dest="show_list", action="store_true", help="以列表形式输出座位（而非平面图）")
     p_seats.add_argument("--json", action="store_true", help="输出原始 JSON")
+    p_seats.add_argument("--image", dest="image", action="store_true", help="生成座位平面图 PNG 图片（配合 --map 或默认 map 模式）")
+    p_seats.add_argument("--image-path", dest="image_path", help="图片保存路径（默认系统临时目录）")
     p_seats.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     p_seats.set_defaults(
         func=_cmd_seats,

@@ -62,6 +62,8 @@ bhlib seats --all                # 显式要求显示全部（与默认行为相
 bhlib seats --list               # 以列表形式输出（仅空闲座位）
 bhlib seats --all --list         # 列表形式输出全部座位
 bhlib seats --area 一层西        # 指定区域
+bhlib seats --image              # 生成 PNG 平面图（保存到系统临时目录）
+bhlib seats --image --image-path ./seat.png   # 指定图片保存路径
 ```
 
 > **平面图自动 `--all` 说明**：`seats` 默认以**平面图（`--map`）**展示。为了让你一眼看到整块区域的使用情况，只要最终输出是平面图（无论是默认、显式 `--map`，还是配置默认格式为 `map`），系统都会**自动显示全部座位状态**，无需再手动加 `--all**。如果你只想看空闲座位，请使用 `--list`。

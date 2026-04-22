@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import struct
+import tempfile
 import unicodedata
+import zlib
 from collections import Counter, defaultdict
 from typing import NamedTuple
 
@@ -319,6 +323,7 @@ def render_seat_map(
     seats: list[dict],
     *,
     compress_blank_rows: bool = True,
+    status_names: dict[str, str] | None = None,
 ) -> str:
     if not seats:
         return "(no seats)"
@@ -507,19 +512,20 @@ def render_seat_map(
                     composed.append(_render_row(colors, chars, len(chars)))
 
     reset = "\x1b[0m"
+    names = status_names if status_names is not None else _STATUS_NAME
     legend_specs: list[tuple[int, str]] = []
     for st in ("1", "2", "6", "7"):
         cnt = counts.get(st, 0)
         if cnt <= 0:
             continue
         color = _STATUS_COLOR.get(st, _DEFAULT_COLOR)
-        name = _STATUS_NAME.get(st, f"status={st}")
+        name = names.get(st, f"status={st}")
         legend_specs.append((color, f"{name} × {cnt}"))
     for st, cnt in counts.items():
         if st in ("1", "2", "6", "7") or cnt <= 0:
             continue
         color = _STATUS_COLOR.get(st, _DEFAULT_COLOR)
-        name = _STATUS_NAME.get(st, f"status={st}")
+        name = names.get(st, f"status={st}")
         legend_specs.append((color, f"{name} × {cnt}"))
 
     # Try to inject the legend as a 2-row block (color blocks above labels),
@@ -574,3 +580,190 @@ def render_seat_map(
         parts.append("")
         parts.append(legend_line)
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Seat-map image export (pure Python, zero external dependencies)
+# ---------------------------------------------------------------------------
+
+_CHAR_W = 16
+_CHAR_H = 24
+_FONT_SCALE = 2
+
+# 8×8 bitmap font for digits 0-9 (classic).  Rendered at 2× → 16×16.
+_FONT_8x8: dict[str, list[int]] = {
+    "0": [0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00],
+    "1": [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
+    "2": [0x3C, 0x66, 0x06, 0x0C, 0x30, 0x60, 0x7E, 0x00],
+    "3": [0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00],
+    "4": [0x06, 0x0E, 0x1E, 0x66, 0x7F, 0x06, 0x06, 0x00],
+    "5": [0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00],
+    "6": [0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00],
+    "7": [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00],
+    "8": [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
+    "9": [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x66, 0x3C, 0x00],
+}
+
+
+def _parse_ansi_line(line: str) -> list[tuple[str, tuple[int, int, int] | None, int]]:
+    """Parse a single ANSI-coloured line into (char, bg_color, width)."""
+    cells: list[tuple[str, tuple[int, int, int] | None, int]] = []
+    i = 0
+    bg: tuple[int, int, int] | None = None
+    while i < len(line):
+        if line.startswith("\x1b[0m", i):
+            bg = None
+            i += 4
+            continue
+        if line.startswith("\x1b[30;48;2;", i):
+            end = line.find("m", i)
+            if end != -1:
+                codes = line[i + 2 : end].split(";")
+                if len(codes) >= 6 and codes[1] == "48" and codes[2] == "2":
+                    bg = (int(codes[3]), int(codes[4]), int(codes[5]))
+                i = end + 1
+                continue
+            i += 1
+            continue
+        ch = line[i]
+        w = 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+        cells.append((ch, bg, w))
+        i += 1
+    # strip trailing plain-space cells so they don't inflate image width
+    while cells and cells[-1][0] == " " and cells[-1][1] is None:
+        cells.pop()
+    return cells
+
+
+def _write_png(width: int, height: int, pixels: bytes) -> bytes:
+    """Write an RGB PNG using only stdlib zlib/struct."""
+
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + ctype
+            + data
+            + struct.pack(">I", zlib.crc32(data, zlib.crc32(ctype)) & 0xFFFFFFFF)
+        )
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b""
+    stride = width * 3
+    for y in range(height):
+        raw += b"\x00" + pixels[y * stride : (y + 1) * stride]
+    compressed = zlib.compress(raw)
+    return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", compressed) + _chunk(b"IEND", b"")
+
+
+def _draw_rect(
+    px: bytearray,
+    img_w: int,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    color: tuple[int, int, int],
+) -> None:
+    r, g, b = color
+    y_start = max(0, y)
+    y_end = min(len(px) // (img_w * 3), y + h)
+    x_start = max(0, x)
+    x_end = min(img_w, x + w)
+    for yy in range(y_start, y_end):
+        offset = (yy * img_w + x_start) * 3
+        for _ in range(x_end - x_start):
+            px[offset] = r
+            px[offset + 1] = g
+            px[offset + 2] = b
+            offset += 3
+
+
+def _draw_char(
+    px: bytearray,
+    img_w: int,
+    x: int,
+    y: int,
+    char: str,
+    color: tuple[int, int, int] = (0, 0, 0),
+) -> None:
+    bits = _FONT_8x8.get(char)
+    if not bits:
+        return
+    r, g, b = color
+    for row_idx, row_bits in enumerate(bits):
+        for col_idx in range(8):
+            if row_bits & (1 << (7 - col_idx)):
+                for dy in range(_FONT_SCALE):
+                    for dx in range(_FONT_SCALE):
+                        cx = x + col_idx * _FONT_SCALE + dx
+                        cy = y + row_idx * _FONT_SCALE + dy
+                        if 0 <= cx < img_w and 0 <= cy < len(px) // (img_w * 3):
+                            off = (cy * img_w + cx) * 3
+                            px[off] = r
+                            px[off + 1] = g
+                            px[off + 2] = b
+
+
+_STATUS_NAME_EN: dict[str, str] = {
+    "1": "Free",
+    "6": "In Use",
+    "7": "Away",
+    "2": "Reserved",
+}
+
+
+def render_seat_map_to_image_bytes(seats: list[dict]) -> bytes:
+    """Render a seat map as a PNG image (bytes).  Pure Python, no external deps."""
+    ansi = render_seat_map(seats, status_names=_STATUS_NAME_EN)
+    lines = ansi.splitlines()
+    grids = [_parse_ansi_line(line) for line in lines]
+
+    rows = len(grids)
+    cols = 0
+    for row in grids:
+        row_width = sum(w for _ch, _bg, w in row)
+        cols = max(cols, row_width)
+
+    img_w = cols * _CHAR_W
+    img_h = rows * _CHAR_H
+    if img_w <= 0 or img_h <= 0:
+        img_w = img_h = 1
+
+    px = bytearray(img_w * img_h * 3)
+    # white background
+    for i in range(0, len(px), 3):
+        px[i] = px[i + 1] = px[i + 2] = 255
+
+    for row_idx, row in enumerate(grids):
+        x = 0
+        y = row_idx * _CHAR_H
+        for ch, bg, w in row:
+            cell_w = w * _CHAR_W
+            if bg is not None:
+                _draw_rect(px, img_w, x, y, cell_w, _CHAR_H, bg)
+            if ch in _FONT_8x8:
+                fx = x + (cell_w - 8 * _FONT_SCALE) // 2
+                fy = y + (_CHAR_H - 8 * _FONT_SCALE) // 2
+                _draw_char(px, img_w, fx, fy, ch)
+            x += cell_w
+
+    return _write_png(img_w, img_h, bytes(px))
+
+
+def render_seat_map_to_image(seats: list[dict], path: str | None = None) -> str:
+    """Render seat map to a PNG file and return the absolute path.
+
+    *path* – destination file path.  When ``None`` a temp file under
+    :func:`tempfile.gettempdir()` is used.
+    """
+    png_bytes = render_seat_map_to_image_bytes(seats)
+    if path is None:
+        fd, path = tempfile.mkstemp(prefix="bhlib_seatmap_", suffix=".png")
+        with os.fdopen(fd, "wb") as f:
+            f.write(png_bytes)
+    else:
+        path = os.path.abspath(path)
+        with open(path, "wb") as f:
+            f.write(png_bytes)
+    return path
