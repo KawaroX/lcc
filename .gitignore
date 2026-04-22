@@ -16,6 +16,8 @@ build/
 llm_*.pdf
 llm_*.png
 plot_llm*.py
+kimi-export-*.md
+seats_data.json
 
 # SwiftPM / Xcode
 .build/
