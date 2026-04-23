@@ -102,7 +102,7 @@ def ensure_logged_in(
     if not username or not password:
         raise ConfigError(
             "需要自动刷新 token 但缺少凭证：请运行 `bhlib login` 重新登录"
-            f"（会把账号密码存到 {CONFIG_FILE}）"
+            f"（会把密码存到系统凭据库，配置路径：{CONFIG_FILE}）"
         )
 
     result = cas_login(
@@ -120,4 +120,5 @@ def ensure_logged_in(
         verify_ssl=(not insecure) and auth.verify_ssl,
         username=username,
         password=password,
+        password_storage=auth.password_storage,
     )

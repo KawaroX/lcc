@@ -578,6 +578,8 @@ def _cmd_auth_show(args: argparse.Namespace) -> int:
             "base_url": auth.base_url,
             "token": _redact(auth.token),
             "cookie": _redact(auth.cookie),
+            "username": auth.username,
+            "password_storage": auth.password_storage,
         },
         ensure_ascii=False,
         indent=2,
@@ -641,8 +643,10 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         default_area_id=default_area_id,
         username=username,
         password=password,
+        password_storage=("plain" if args.plain_password else "keyring"),
     )
-    print(f"OK: 登录成功（{username}），配置已写入 {CONFIG_FILE}")
+    storage_label = "明文配置兜底" if args.plain_password else "系统凭据库"
+    print(f"OK: 登录成功（{username}），配置已写入 {CONFIG_FILE}，密码保存到{storage_label}")
     return 0
 
 
@@ -1530,9 +1534,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # === login ===
-    p_login = sub.add_parser("login", help="北航 SSO 登录（从 .env 读账号密码）")
+    p_login = sub.add_parser("login", help="北航 SSO 登录（默认用系统凭据库保存密码）")
     p_login.add_argument("--username", help="学号/工号；不传则读 .env 的 BHLIB_USERNAME")
     p_login.add_argument("--password", help="SSO 密码（不传则交互式输入）")
+    p_login.add_argument("--plain-password", action="store_true", help="把密码明文保存到配置文件（系统凭据库不可用时的兜底）")
     p_login.add_argument("--seed-cookie", help=argparse.SUPPRESS)
     p_login.add_argument("--base-url", default=None, help=argparse.SUPPRESS)
     p_login.add_argument("--timeout", type=float, default=20.0, help=argparse.SUPPRESS)
@@ -1811,13 +1816,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Handle --version before any other processing
     if "--version" in raw_argv or "-V" in raw_argv:
-        from importlib.metadata import version
         try:
-            print(f"bhlib {version('bhlib')}")
-        except Exception:
-            # fallback to the version defined in the package
             from bhlib import __version__
             print(f"bhlib {__version__}")
+        except Exception:
+            from importlib.metadata import version
+            print(f"bhlib {version('bhlib')}")
         return 0
 
     # Global flags that apply to any subcommand; we strip them before argparse.

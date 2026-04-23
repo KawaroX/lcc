@@ -9,6 +9,9 @@ from typing import Any
 from .env import load_env
 
 DEFAULT_BASE_URL = "https://booking.lib.buaa.edu.cn"
+KEYRING_SERVICE = "bhlib"
+PASSWORD_STORAGE_KEYRING = "keyring"
+PASSWORD_STORAGE_PLAIN = "plain"
 
 LEGACY_CONFIG_DIR = Path.home() / ".bhlib"
 LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / "config.json"
@@ -42,6 +45,7 @@ class AuthConfig:
     seat_format: str | None = None  # "map" or "list"
     username: str | None = None
     password: str | None = None
+    password_storage: str | None = None  # "keyring" or "plain"
 
 
 def _config_path() -> Path:
@@ -71,6 +75,52 @@ def _load_file() -> dict[str, Any]:
         return {}
     except json.JSONDecodeError as e:
         raise ConfigError(f"{CONFIG_FILE} 不是合法 JSON: {e}") from e
+
+
+def _keyring_account(username: str) -> str:
+    username = (username or "").strip()
+    if not username:
+        raise ConfigError("保存到系统凭据库需要 username")
+    return username
+
+
+def _load_keyring_module():
+    try:
+        import keyring  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ConfigError(
+            "当前环境没有安装 keyring，无法使用系统凭据库；"
+            "请重新安装/升级 bhlib，或用 `bhlib login --plain-password` 使用明文兜底。"
+        ) from e
+    return keyring
+
+
+def _save_password_keyring(*, username: str, password: str) -> None:
+    keyring = _load_keyring_module()
+    try:
+        keyring.set_password(KEYRING_SERVICE, _keyring_account(username), password)
+    except Exception as e:  # noqa: BLE001
+        raise ConfigError(
+            "无法把密码保存到系统凭据库；"
+            "如果当前系统/桌面环境没有可用 keyring，可用 `bhlib login --plain-password` 使用明文兜底。"
+        ) from e
+
+
+def _load_password_keyring(*, username: str) -> str | None:
+    try:
+        keyring = _load_keyring_module()
+        password = keyring.get_password(KEYRING_SERVICE, _keyring_account(username))
+    except Exception:
+        return None
+    return password or None
+
+
+def _delete_password_keyring(*, username: str) -> None:
+    keyring = _load_keyring_module()
+    try:
+        keyring.delete_password(KEYRING_SERVICE, _keyring_account(username))
+    except Exception:
+        return
 
 
 def _maybe_migrate_legacy_config() -> None:
@@ -106,6 +156,7 @@ def save_auth(
     default_area_id: str | None = None,
     username: str | None = None,
     password: str | None = None,
+    password_storage: str | None = None,
 ) -> None:
     token = (token or "").strip()
     cookie = (cookie or "").strip()
@@ -124,7 +175,18 @@ def save_auth(
     if username is not None:
         data["username"] = username.strip()
     if password is not None:
-        data["password"] = password
+        storage = (password_storage or data.get("password_storage") or PASSWORD_STORAGE_KEYRING)
+        storage = str(storage).strip().lower()
+        username_for_password = (username or data.get("username") or "").strip()
+        if storage == PASSWORD_STORAGE_KEYRING:
+            _save_password_keyring(username=username_for_password, password=password)
+            data["password_storage"] = PASSWORD_STORAGE_KEYRING
+            data.pop("password", None)
+        elif storage == PASSWORD_STORAGE_PLAIN:
+            data["password_storage"] = PASSWORD_STORAGE_PLAIN
+            data["password"] = password
+        else:
+            raise ConfigError(f"未知 password_storage: {password_storage}")
     _write(data)
 
 
@@ -132,11 +194,19 @@ def save_credentials(*, username: str, password: str) -> None:
     """Persist SSO credentials so the daemon can auto-refresh tokens without env vars."""
     data = _load_file()
     data["username"] = username.strip()
-    data["password"] = password
+    _save_password_keyring(username=username, password=password)
+    data["password_storage"] = PASSWORD_STORAGE_KEYRING
+    data.pop("password", None)
     _write(data)
 
 
 def clear_auth() -> None:
+    try:
+        data = _load_file()
+        if data.get("password_storage") == PASSWORD_STORAGE_KEYRING and data.get("username"):
+            _delete_password_keyring(username=str(data["username"]))
+    except ConfigError:
+        pass
     if CONFIG_FILE.exists():
         CONFIG_FILE.unlink()
 
@@ -180,12 +250,16 @@ def load_auth_loose() -> AuthConfig:
         or None
     )
     username = _pick("username", file_data=file_data, env_file=env_file) or None
-    password = (
-        os.environ.get("BHLIB_PASSWORD")
-        or env_file.get("BHLIB_PASSWORD")
-        or file_data.get("password")
-        or ""
-    )
+    password_storage = str(file_data.get("password_storage") or "").strip().lower() or None
+    password = os.environ.get("BHLIB_PASSWORD") or env_file.get("BHLIB_PASSWORD") or ""
+    if not password:
+        if password_storage == PASSWORD_STORAGE_KEYRING and username:
+            password = _load_password_keyring(username=username) or ""
+        else:
+            # Backward-compatible read path for old configs and explicit plain fallback.
+            password = file_data.get("password") or ""
+            if password and not password_storage:
+                password_storage = PASSWORD_STORAGE_PLAIN
     password = password or None
 
     return AuthConfig(
@@ -197,6 +271,7 @@ def load_auth_loose() -> AuthConfig:
         seat_format=seat_format,
         username=username,
         password=password,
+        password_storage=password_storage,
     )
 
 

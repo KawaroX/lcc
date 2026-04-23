@@ -5,7 +5,7 @@
 ## 免责声明
 
 - 请确保你的使用符合学校/图书馆的服务条款与相关规定。
-- `token` / `cookie` / 账号密码存在用户配置目录下的 `bhlib/config.json`（会尝试设为权限 0600），请勿泄露。
+- `token` / `cookie` 存在用户配置目录下的 `bhlib/config.json`（会尝试设为权限 0600）；SSO 密码默认存在系统凭据库，使用 `--plain-password` 时才会明文写入配置。请勿泄露这些信息。
 
 ## 安装
 
@@ -40,6 +40,12 @@ bhlib login
 ```
 
 之后**从任何目录**跑 `bhlib` 都能用。token 到期时会用保存的账号密码自动续约，不需要任何 `.env` 或环境变量。
+
+默认情况下，密码会保存到系统凭据库（macOS Keychain / Windows Credential Manager / Linux Secret Service 等），`config.json` 只保存 token、cookie、username 和偏好设置。如果当前系统没有可用的凭据库，可显式使用明文兜底：
+
+```bash
+bhlib login --plain-password
+```
 
 ## 常用命令
 
@@ -182,7 +188,8 @@ bhlib --insecure login           # 这次跳过证书校验
 
 ## 安全提示
 
-- 配置文件 `bhlib/config.json` 里是明文的账号密码 + token（具体路径取决于系统）。
+- 默认情况下，SSO 密码保存在系统凭据库，不写入 `bhlib/config.json`；`bhlib login --plain-password` 会恢复旧的明文保存方式。
+- 配置文件里仍会保存 token / cookie（具体路径取决于系统）。
 - Token 是 JWT，包含学号、姓名等个人信息；贴抓包/日志时请脱敏。
 - 怀疑泄露了 token，重新 `bhlib login` 会让旧 token 作废；必要时修改 SSO 密码。
 
