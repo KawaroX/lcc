@@ -9,6 +9,7 @@ import urllib.response
 from dataclasses import dataclass
 from http.cookiejar import Cookie, CookieJar
 
+from .netdiag import append_tun_route_hint
 from .ssl_ctx import make_ssl_context
 
 
@@ -159,7 +160,7 @@ def cas_login(
         with opener.open(req_get, timeout=timeout_sec) as resp:
             html = resp.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as e:
-        msg = f"获取 SSO 登录页失败: {e}"
+        msg = append_tun_route_hint(f"获取 SSO 登录页失败: {e}", hosts=["sso.buaa.edu.cn"])
         raise CasLoginError(msg) from e
 
     execution = _extract_execution(html)
@@ -195,7 +196,7 @@ def cas_login(
     except urllib.error.HTTPError as e:
         raise CasLoginError(f"SSO 登录失败（HTTP {e.code}）") from e
     except urllib.error.URLError as e:
-        msg = f"SSO 登录请求失败: {e}"
+        msg = append_tun_route_hint(f"SSO 登录请求失败: {e}", hosts=["sso.buaa.edu.cn"])
         raise CasLoginError(msg) from e
 
     cas = _extract_cas_from_urls([final_url, *redirect.locations])
@@ -225,7 +226,7 @@ def cas_login(
         raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
         raise CasLoginError(f"换取 token 失败（HTTP {e.code}）: {raw[:200]}") from e
     except urllib.error.URLError as e:
-        msg = f"换取 token 网络错误: {e}"
+        msg = append_tun_route_hint(f"换取 token 网络错误: {e}", hosts=["booking.lib.buaa.edu.cn"])
         raise CasLoginError(msg) from e
 
     try:

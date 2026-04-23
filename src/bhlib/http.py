@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+from .netdiag import append_tun_route_hint
 from .ssl_ctx import make_ssl_context
 
 
@@ -78,4 +80,6 @@ def post_json(
         raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
         raise HttpError(f"HTTP {e.code}: {raw[:200]}") from e
     except urllib.error.URLError as e:
-        raise HttpError(f"网络错误: {e}") from e
+        host = urllib.parse.urlparse(base_url).hostname or "booking.lib.buaa.edu.cn"
+        msg = append_tun_route_hint(f"网络错误: {e}", hosts=[host])
+        raise HttpError(msg) from e
