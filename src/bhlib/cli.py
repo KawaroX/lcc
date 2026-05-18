@@ -1303,6 +1303,53 @@ def _cmd_book(args: argparse.Namespace) -> int:
     return _cmd_space_book(args)
 
 
+def _cmd_swap(args: argparse.Namespace) -> int:
+    seat = (args.seat or "").strip() if getattr(args, "seat", None) else ""
+    if not seat:
+        raise ConfigError("缺少目标座位号（用法：bhlib swap <seat>；--id 时为座位 id）")
+
+    auth = load_auth_loose()
+    verify_ssl = _effective_verify_ssl(auth, args)
+
+    print("→ 正在离馆…")
+    sub = _fetch_subscribe(
+        args, auth,
+        timeout=float(args.timeout),
+        verify_ssl=verify_ssl,
+        insecure=bool(args.insecure),
+    )
+    try:
+        item = _pick_my_active_item(sub, prefer_area_id=args.prefer_area_id)
+    except ConfigError as e:
+        print(f"（跳过离馆：{e}）")
+    else:
+        payload = _space_payload_from_subscribe_item(item, style=args.style)
+        aesjson = aesjson_encrypt(payload, day=args.day)
+        if args.dry_run:
+            print(json.dumps(
+                {"path": "/v4/space/checkout", "payload": payload, "aesjson": aesjson},
+                ensure_ascii=False, indent=2,
+            ))
+        else:
+            data = post_json_authed(
+                path="/v4/space/checkout",
+                json_body={"aesjson": aesjson},
+                timeout_sec=float(args.timeout),
+                insecure=bool(args.insecure),
+                verify_ssl=verify_ssl,
+                use_proxy=_effective_use_proxy(args),
+            )
+            _print_api_result(data)
+            if isinstance(data, dict):
+                code = data.get("code")
+                if code is not None and code != 0:
+                    print("离馆失败，已中止换座位流程。")
+                    return 1
+
+    print(f"→ 正在预约座位 {seat}…")
+    return _cmd_book(args)
+
+
 def _cmd_light(args: argparse.Namespace) -> int:
     args.brightness = _parse_light_arg(args.value)
     return _cmd_light_set(args)
@@ -1571,6 +1618,30 @@ def build_parser() -> argparse.ArgumentParser:
         end_time=None,
         segment=None,
         crypto_day=None,
+    )
+
+    # === swap (checkout + book) ===
+    p_swap = sub.add_parser(
+        "swap",
+        help="换座位：先离馆当前座位，再预约指定座位号（用法：bhlib swap <seat>）",
+    )
+    p_swap.add_argument("seat", help="目标座位号（默认按 no；配合 --id 则为座位 id）")
+    p_swap.add_argument("--id", dest="by_id", action="store_true", help="把 seat 解释为座位 id 而不是座位号")
+    p_swap.add_argument("--area", dest="area_id", help="区域（id 或名字，模糊匹配）")
+    p_swap.add_argument("--day", help="日期 YYYY-MM-DD（也支持 YYYYMMDD；默认今天）")
+    p_swap.add_argument("--start", dest="start_time", help="开始时间 HH:MM（默认当前时间）")
+    p_swap.add_argument("--segment", help=argparse.SUPPRESS)
+    p_swap.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    p_swap.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_swap.set_defaults(
+        func=_cmd_swap,
+        insecure=False,
+        end_time=None,
+        crypto_day=None,
+        all=False,
+        data=None,
+        style="device_points",
+        prefer_area_id=None,
     )
 
     # === signin / leave / checkout ===

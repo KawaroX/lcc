@@ -63,6 +63,10 @@ bhlib signin                     # 签到（到馆）
 bhlib leave                      # 暂离
 bhlib checkout                   # 离馆
 
+bhlib swap 131                   # 换座位：先 checkout 当前座位，再 book no=131
+bhlib swap --id 276              # 同上，但按座位 id
+bhlib swap --area 三层西 131     # 指定区域后换到该区域的 131 号
+
 bhlib seats                      # 默认区域的座位状态（默认输出终端平面图）
 bhlib seats --all                # 显式要求显示全部（与默认行为相同）
 bhlib seats --list               # 以列表形式输出（仅空闲座位）
