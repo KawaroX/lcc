@@ -551,6 +551,16 @@ def _redact(value: str, keep: int = 6) -> str:
     return f"…{value[-keep:]} ({len(value)} chars)"
 
 
+def _is_trivial_extra(extra: object) -> bool:
+    """API success responses often carry a no-op extra like {"status": 0} or
+    {"code": 0}. Suppress those — the ✓ line already conveys success."""
+    if extra in (None, [], {}):
+        return True
+    if isinstance(extra, dict):
+        return all(v in (0, "0", None, "", False) for v in extra.values())
+    return False
+
+
 def _print_api_result(data: object) -> None:
     """Pretty-print a typical API response: ✓ + message on success,
     ✗ + dim error code on failure, otherwise full JSON."""
@@ -562,7 +572,7 @@ def _print_api_result(data: object) -> None:
     extra = data.get("data")
     extra_json = (
         json.dumps(extra, ensure_ascii=False, indent=2)
-        if extra not in (None, [], {})
+        if not _is_trivial_extra(extra)
         else None
     )
     if code == 0 and msg:
