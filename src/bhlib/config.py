@@ -32,7 +32,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
 class ConfigError(RuntimeError):
-    pass
+    def __init__(self, msg: str, *, hint=None):
+        super().__init__(msg)
+        self.hint = hint
 
 
 @dataclass(frozen=True)
@@ -89,8 +91,8 @@ def _load_keyring_module():
         import keyring  # type: ignore[import-not-found]
     except ImportError as e:
         raise ConfigError(
-            "当前环境没有安装 keyring，无法使用系统凭据库；"
-            "请重新安装/升级 bhlib，或用 `bhlib login --plain-password` 使用明文兜底。"
+            "未安装 keyring 模块",
+            hint="重装 bhlib 或加 --plain-password 使用明文",
         ) from e
     return keyring
 

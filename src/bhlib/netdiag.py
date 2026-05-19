@@ -17,14 +17,9 @@ class RouteInfo:
     detail: str = ""
 
 
-def append_tun_route_hint(message: str, *, hosts: Iterable[str]) -> str:
-    hint = tun_route_hint(hosts=hosts)
-    if not hint:
-        return message
-    return f"{message}\n{hint}"
-
-
-def tun_route_hint(*, hosts: Iterable[str]) -> str | None:
+def tun_route_hint_lines(*, hosts: Iterable[str]) -> list[str]:
+    """If any host routes through a TUN/VPN-looking interface, return a list of
+    short dim-friendly lines: [route-fact, suggestion]. Else return []."""
     for host in hosts:
         info = _route_info_for_host(host)
         if info is None:
@@ -33,12 +28,11 @@ def tun_route_hint(*, hosts: Iterable[str]) -> str | None:
         if not _looks_like_tun_interface(haystack):
             continue
         detail = f"（{info.detail}）" if info.detail and info.detail != info.interface else ""
-        return (
-            f"检测到 {info.host} 当前路由可能走了 {info.interface}{detail}，"
-            "这通常说明 TUN/VPN 接管了校园网域名。"
-            "请把 *.buaa.edu.cn 加入 DIRECT/绕过规则，或临时关闭 TUN 后重试。"
-        )
-    return None
+        return [
+            f"{info.host} → {info.interface}{detail}（疑似 VPN/TUN）",
+            "建议 *.buaa.edu.cn 加入直连，或临时关闭 TUN",
+        ]
+    return []
 
 
 def _route_info_for_host(host: str) -> RouteInfo | None:

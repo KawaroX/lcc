@@ -6,12 +6,14 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from .netdiag import append_tun_route_hint
+from .netdiag import tun_route_hint_lines
 from .ssl_ctx import make_ssl_context
 
 
 class HttpError(RuntimeError):
-    pass
+    def __init__(self, msg: str, *, hint=None):
+        super().__init__(msg)
+        self.hint = hint
 
 
 @dataclass(frozen=True)
@@ -81,5 +83,5 @@ def post_json(
         raise HttpError(f"HTTP {e.code}: {raw[:200]}") from e
     except urllib.error.URLError as e:
         host = urllib.parse.urlparse(base_url).hostname or "booking.lib.buaa.edu.cn"
-        msg = append_tun_route_hint(f"网络错误: {e}", hosts=[host])
-        raise HttpError(msg) from e
+        hint = tun_route_hint_lines(hosts=[host])
+        raise HttpError(f"网络错误: {e}", hint=hint or None) from e

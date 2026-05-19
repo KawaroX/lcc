@@ -27,6 +27,7 @@ from .crypto import CryptoError, aesjson_decrypt, aesjson_encrypt
 from .http import HttpError
 from .env import load_env
 from .seatmap import render_seat_map
+from . import ui
 
 
 def _normalize_day_yyyy_mm_dd(v: str) -> str:
@@ -90,15 +91,16 @@ def _interactive_pick_area(args: argparse.Namespace, auth) -> str:
     if not items:
         raise ConfigError("获取区域列表为空")
 
-    print("未设置默认区域，请选择：")
+    ui.section("未设置默认区域，请选择")
     for idx, a in enumerate(items, 1):
         label = f"{a.get('premiseName', '')} / {a.get('storeyName', '')} / {a.get('name', '')}".strip(" /")
         free = a.get("freeNum")
         total = a.get("totalNum")
-        suffix = f"  [{free}/{total}]" if free is not None and total is not None else ""
-        print(f"  {idx:>3}. {label}{suffix}  (id={a.get('id')})")
+        suffix = ui.dim(f"  [{free}/{total}]") if free is not None and total is not None else ""
+        id_tag = ui.dim(f"id={a.get('id')}")
+        print(f"  {idx:>3}.  {label}{suffix}  {id_tag}")
     try:
-        raw = input("序号 / 名字 / id: ").strip()
+        raw = input(f"序号 / 名字 / id {ui.dim('>')} ").strip()
     except EOFError:
         raise ConfigError("未选择区域") from None
     if not raw:
@@ -538,7 +540,7 @@ def _cmd_auth_set(args: argparse.Namespace) -> int:
         verify_ssl=(not args.insecure),
         default_area_id=default_area_id,
     )
-    print(f"OK: 已写入 {CONFIG_FILE}")
+    ui.ok("已写入", detail=str(CONFIG_FILE))
     return 0
 
 
@@ -550,23 +552,27 @@ def _redact(value: str, keep: int = 6) -> str:
 
 
 def _print_api_result(data: object) -> None:
-    """Pretty-print a typical API response: show a checkmark + message on success,
-    otherwise preserve the full JSON."""
+    """Pretty-print a typical API response: ✓ + message on success,
+    ✗ + dim error code on failure, otherwise full JSON."""
     if not isinstance(data, dict):
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return
     code = data.get("code")
     msg = data.get("message") or data.get("msg")
+    extra = data.get("data")
+    extra_json = (
+        json.dumps(extra, ensure_ascii=False, indent=2)
+        if extra not in (None, [], {})
+        else None
+    )
     if code == 0 and msg:
-        print(f"✅ {msg}")
-        extra = data.get("data")
-        if extra is not None and extra != [] and extra != {}:
-            print(json.dumps(extra, ensure_ascii=False, indent=2))
+        ui.ok(msg)
+        if extra_json:
+            print(extra_json)
     elif code is not None and code != 0 and msg:
-        print(f"❌ [{code}] {msg}")
-        extra = data.get("data")
-        if extra is not None and extra != [] and extra != {}:
-            print(json.dumps(extra, ensure_ascii=False, indent=2))
+        ui.err(msg, hint=f"错误码 {code}")
+        if extra_json:
+            print(extra_json)
     else:
         print(json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -589,7 +595,7 @@ def _cmd_auth_show(args: argparse.Namespace) -> int:
 
 def _cmd_auth_clear(args: argparse.Namespace) -> int:
     clear_auth()
-    print(f"OK: 已删除 {CONFIG_FILE}")
+    ui.ok("已删除", detail=str(CONFIG_FILE))
     return 0
 
 
@@ -628,7 +634,7 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
             verify_ssl=(not args.insecure),
         )
     except CasLoginError as e:
-        raise ConfigError(str(e)) from e
+        raise ConfigError(str(e), hint=getattr(e, "hint", None)) from e
 
     default_area_id = None
     try:
@@ -646,7 +652,7 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         password_storage=("plain" if args.plain_password else "keyring"),
     )
     storage_label = "明文配置兜底" if args.plain_password else "系统凭据库"
-    print(f"OK: 登录成功（{username}），配置已写入 {CONFIG_FILE}，密码保存到{storage_label}")
+    ui.ok(f"登录成功（{username}）", detail=f"配置已写入 {CONFIG_FILE} · 密码保存到{storage_label}")
     return 0
 
 
@@ -794,7 +800,7 @@ def _cmd_pomo_flash(args: argparse.Namespace) -> int:
         cycles=int(args.cycles),
         interval=float(args.interval),
     )
-    print(f"OK: 已闪烁 {args.cycles} 次（{args.low}->{args.high}->{args.low}）")
+    ui.ok(f"已闪烁 {args.cycles} 次", detail=f"{args.low} → {args.high} → {args.low}")
     return 0
 
 
@@ -807,14 +813,15 @@ def _cmd_pomo_start(args: argparse.Namespace) -> int:
         raise ConfigError("番茄钟时长必须为正数（duration，如 25 / 25m / 1h）")
 
     end_at = _dt.datetime.now() + _dt.timedelta(seconds=total_sec)
-    print(f"Pomodoro 开始：{total_sec:.0f}s，预计结束时间：{end_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    ui.info(f"番茄钟开始 · {total_sec:.0f}s")
+    ui.tip(f"预计结束 {end_at.strftime('%Y-%m-%d %H:%M:%S')}")
     try:
         time.sleep(total_sec)
     except KeyboardInterrupt:
-        print("已取消（Ctrl-C）")
+        ui.tip("已取消")
         return 130
 
-    print("时间到：开始闪烁灯光…")
+    ui.info("时间到，开始闪烁灯光…")
     _flash_light_brightness(
         args,
         low=int(args.low),
@@ -822,7 +829,7 @@ def _cmd_pomo_start(args: argparse.Namespace) -> int:
         cycles=int(args.cycles),
         interval=float(args.interval),
     )
-    print("OK: 番茄钟完成")
+    ui.ok("番茄钟完成")
     return 0
 
 
@@ -1004,7 +1011,8 @@ def _cmd_space_book(args: argparse.Namespace) -> int:
 
     if _time_hh_mm_to_minutes(start_time) >= _time_hh_mm_to_minutes(end_time):
         raise ConfigError(
-            f"时间区间无效：start_time={start_time} end_time={end_time}（请检查 --start/--end；格式 HH:MM，例如 --start 07:00 --end 23:00；日期用 --day YYYY-MM-DD）"
+            f"时间区间无效：{start_time}–{end_time}",
+            hint="--start HH:MM --end HH:MM（如 07:00 / 23:00）",
         )
 
     # Fetch seat list (for both display and segment discovery).
@@ -1101,19 +1109,22 @@ def _cmd_space_book(args: argparse.Namespace) -> int:
             raise ConfigError(f"找不到 seat_no={args.seat_no}")
         seat_id = _s(matches[0].get("id"))
     else:
-        header = f"area_id={area_id} day={day} {start_time}-{end_time}"
+        meta = f"area {area_id} · {day} · {start_time}-{end_time}"
         if segment:
-            header += f" segment={segment}"
-        print(header)
-        print(f"{'id':>7}  {'no':>4}  {'status':>6}  status_name")
-        for s in seats_show[:300]:
-            print(f"{_s(s.get('id')):>7}  {_s(s.get('no')):>4}  {_s(s.get('status')):>6}  {_s(s.get('status_name'))}")
+            meta += f" · segment {segment}"
+        print(ui.dim(meta))
+        rows_show = [
+            [_s(s.get("id")), _s(s.get("no")), _s(s.get("status")), _s(s.get("status_name"))]
+            for s in seats_show[:300]
+        ]
+        ui.table(["ID", "NO", "状态", "名称"], rows_show, aligns=["right", "right", "right", "left"])
         if len(seats_show) > 300:
-            print(f"... 仅显示前 300 条（总计 {len(seats_show)}）")
+            ui.tip(f"仅显示前 300 条（总计 {len(seats_show)}）")
 
-        raw = input("选择座位（默认按 seat no；支持 'id:131' / 'no:003'；直接回车取消）：").strip()
+        prompt_hint = ui.dim("[回车取消 · id:131 / no:003]")
+        raw = input(f"选择座位 {prompt_hint}: ").strip()
         if not raw:
-            print("取消")
+            ui.tip("取消")
             return 0
 
         def _match_by_id(value: str) -> list[dict]:
@@ -1150,15 +1161,14 @@ def _cmd_space_book(args: argparse.Namespace) -> int:
                     raise ConfigError(f"找不到座位：{raw}")
 
     if not segment:
-        # Print the first seat item's keys so we can identify the correct field name.
         _seats_debug = _extract_seats_from_seat_resp(seat_resp)
         sample = _seats_debug[0] if _seats_debug else seat_resp.get("data")
-        print("--- seat 响应样本（用于定位 segment 字段）---", file=sys.stderr)
+        print(ui.dim("--- seat 响应样本（用于定位 segment 字段）---"), file=sys.stderr)
         print(json.dumps(sample, ensure_ascii=False, indent=2), file=sys.stderr)
-        print("---", file=sys.stderr)
+        print(ui.dim("---"), file=sys.stderr)
         raise ConfigError(
-            "缺少 segment：seat 响应里没找到（样本已打印到 stderr）。\n"
-            "请把 stderr 的输出贴到 issue，或用 `--segment <值>` 临时传入。"
+            "缺少 segment 字段",
+            hint=["样本已打印到 stderr", "可用 --segment <值> 临时传入"],
         )
     cache_segment(area_id=str(area_id), start_time=start_time, end_time=end_time, segment=str(segment))
 
@@ -1214,7 +1224,8 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
 
     if (args.start_time is None) and (args.end_time is None) and _time_hh_mm_to_minutes(start_time) >= _time_hh_mm_to_minutes(end_time):
         raise ConfigError(
-            f"默认时间区间无效：start_time={start_time} end_time={end_time}（当前时间已晚于默认 --end 23:00；请手动指定 --start/--end，格式 HH:MM；日期用 --day YYYY-MM-DD，例如 --day 2026-04-21）"
+            f"当前时间 {start_time} 已晚于默认结束时间 23:00",
+            hint=["手动指定 --start HH:MM --end HH:MM", "或用 --day 切到次日"],
         )
 
     payload = {
@@ -1271,20 +1282,25 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
     def _s(v) -> str:
         return "" if v is None else str(v)
 
-    seg_part = f" segment={segment}" if segment else ""
-    print(f"area_id={area_id} day={day} {start_time}-{end_time}{seg_part} seats={len(rows)}")
+    meta = f"area {area_id} · {day} · {start_time}-{end_time}"
+    if segment:
+        meta += f" · segment {segment}"
+    meta += f" · {len(rows)} 座"
+    print(ui.dim(meta))
     if getattr(args, "show_map", False):
         if getattr(args, "image", False):
             from .seatmap import render_seat_map_to_image
 
             img_path = render_seat_map_to_image(rows, path=getattr(args, "image_path", None))
-            print(f"image={img_path}")
+            ui.ok("已生成平面图", detail=str(img_path))
             return 0
         print(render_seat_map(rows))
         return 0
-    print(f"{'id':>7}  {'no':>4}  {'status':>6}  status_name")
-    for it in rows:
-        print(f"{_s(it.get('id')):>7}  {_s(it.get('no')):>4}  {_s(it.get('status')):>6}  {_s(it.get('status_name'))}")
+    table_rows = [
+        [_s(it.get("id")), _s(it.get("no")), _s(it.get("status")), _s(it.get("status_name"))]
+        for it in rows
+    ]
+    ui.table(["ID", "NO", "状态", "名称"], table_rows, aligns=["right", "right", "right", "left"])
     return 0
 
 
@@ -1311,7 +1327,7 @@ def _cmd_swap(args: argparse.Namespace) -> int:
     auth = load_auth_loose()
     verify_ssl = _effective_verify_ssl(auth, args)
 
-    print("→ 正在离馆…")
+    ui.info("正在离馆…")
     sub = _fetch_subscribe(
         args, auth,
         timeout=float(args.timeout),
@@ -1321,7 +1337,7 @@ def _cmd_swap(args: argparse.Namespace) -> int:
     try:
         item = _pick_my_active_item(sub, prefer_area_id=args.prefer_area_id)
     except ConfigError as e:
-        print(f"（跳过离馆：{e}）")
+        ui.tip(f"跳过离馆：{e}")
     else:
         payload = _space_payload_from_subscribe_item(item, style=args.style)
         aesjson = aesjson_encrypt(payload, day=args.day)
@@ -1343,10 +1359,10 @@ def _cmd_swap(args: argparse.Namespace) -> int:
             if isinstance(data, dict):
                 code = data.get("code")
                 if code is not None and code != 0:
-                    print("离馆失败，已中止换座位流程。")
+                    ui.err("离馆失败，已中止换座位")
                     return 1
 
-    print(f"→ 正在预约座位 {seat}…")
+    ui.info(f"正在预约座位 {seat}…")
     return _cmd_book(args)
 
 
@@ -1447,12 +1463,13 @@ def _cmd_pomo_start_daemon(args: argparse.Namespace) -> int:
     }
     save_pomo_state(state)
 
-    print(f"✅ 番茄钟已启动（PID: {pid}）")
-    print(f"   时长: {total_sec // 60} 分 {total_sec % 60} 秒")
-    print(f"   结束时间: {state['end_at']}")
-    print(f"   原始亮度: {current_brightness}")
-    print(f"   闪烁: {low}↔{high} x{cycles}")
-    print("使用 'bhlib pomo status' 查看状态，'bhlib pomo stop' 提前停止")
+    ui.ok(f"番茄钟已启动 · PID {pid}")
+    kw = 8
+    ui.kv("时长", f"{total_sec // 60} 分 {total_sec % 60} 秒", key_width=kw)
+    ui.kv("结束时间", state["end_at"], key_width=kw)
+    ui.kv("原始亮度", str(current_brightness), key_width=kw)
+    ui.kv("闪烁", f"{low} ↔ {high} × {cycles}", key_width=kw)
+    ui.tip("bhlib pomo status 查看 · bhlib pomo stop 提前停止")
     return 0
 
 
@@ -1464,29 +1481,27 @@ def _cmd_pomo_status(args: argparse.Namespace) -> int:
 
     state = load_pomo_state()
     if not state:
-        print("没有活跃的番茄钟")
+        ui.tip("没有活跃的番茄钟")
         return 0
 
-    print("番茄钟状态:")
-    print(f"   PID: {state.get('pid', 'N/A')}")
-    print(f"   开始时间: {state.get('started_at', 'N/A')}")
-    print(f"   时长: {state.get('duration_seconds', 0)} 秒")
-    print(f"   结束时间: {state.get('end_at', 'N/A')}")
-    print(f"   原始亮度: {state.get('original_brightness', 'N/A')}")
-    print(f"   设备: {state.get('device_id', 'N/A')} (区域: {state.get('area_id', 'N/A')})")
-    print(f"   闪烁设置: {state.get('low', 20)}↔{state.get('high', 40)} x{state.get('cycles', 2)}")
-    print(f"   状态: {state.get('status', 'unknown')}")
+    ui.section("番茄钟状态")
+    kw = 10
+    ui.kv("PID", str(state.get("pid", "N/A")), key_width=kw)
+    ui.kv("开始时间", str(state.get("started_at", "N/A")), key_width=kw)
+    ui.kv("时长", f"{state.get('duration_seconds', 0)} 秒", key_width=kw)
+    ui.kv("结束时间", str(state.get("end_at", "N/A")), key_width=kw)
+    ui.kv("原始亮度", str(state.get("original_brightness", "N/A")), key_width=kw)
+    ui.kv("设备", f"{state.get('device_id', 'N/A')} · 区域 {state.get('area_id', 'N/A')}", key_width=kw)
+    ui.kv("闪烁设置", f"{state.get('low', 20)} ↔ {state.get('high', 40)} × {state.get('cycles', 2)}", key_width=kw)
 
-    # 检查进程是否存活
     if is_pomo_running():
         remaining = calculate_remaining_seconds(state)
         if remaining > 0:
-            print(f"   🟢 运行中，剩余: {format_remaining_time(remaining)}")
+            ui.ok(f"运行中 · 剩余 {format_remaining_time(remaining)}")
         else:
-            print("   🟡 计时结束，可能正在闪烁或恢复")
+            ui.warn("计时结束，可能正在闪烁或恢复")
     else:
-        print("   🔴 进程未运行（可能已结束或崩溃）")
-        print("   使用 'bhlib pomo stop' 清理状态")
+        ui.err("进程未运行（可能已结束或崩溃）", hint="bhlib pomo stop 清理状态")
 
     return 0
 
@@ -1498,28 +1513,26 @@ def _cmd_pomo_stop(args: argparse.Namespace) -> int:
 
     state = load_pomo_state()
     if not state:
-        print("没有活跃的番茄钟")
+        ui.tip("没有活跃的番茄钟")
         return 0
 
     pid = state.get('pid')
     if not isinstance(pid, int):
-        print("状态中 PID 无效")
+        ui.warn("状态中 PID 无效")
         clear_pomo_state()
         return 0
 
-    # 停止进程
     if is_pomo_running():
-        print(f"正在停止进程 {pid}...")
+        ui.info(f"正在停止进程 {pid}…")
         if stop_daemon(pid):
-            print("✅ 已发送停止信号")
+            ui.ok("已发送停止信号")
         else:
-            print("⚠️  进程可能已结束")
+            ui.warn("进程可能已结束")
     else:
-        print("进程未在运行")
+        ui.tip("进程未在运行")
 
-    # 清理状态
     clear_pomo_state()
-    print("状态已清理")
+    ui.ok("状态已清理")
     return 0
 
 
@@ -1851,17 +1864,26 @@ def _cmd_area_list(args: argparse.Namespace) -> int:
         return 0
 
     if args.flat:
-        for a in flatten_areas(tree):
-            print(f"{a['id']:>4}  {a['nameMerge']}  free={a['free_num']}/{a['total_num']}  [{a['typeName']}]")
+        rows = [
+            [str(a["id"]), a["nameMerge"], f"{a['free_num']}/{a['total_num']}", a["typeName"]]
+            for a in flatten_areas(tree)
+        ]
+        ui.table(["ID", "区域", "空闲/总数", "类型"], rows, aligns=["right", "left", "right", "left"])
         return 0
 
-    print(f"day={tree['day']}")
+    print(ui.dim(f"day {tree['day']}"))
     for pr in tree["premises"]:
-        print(f"◆ {pr['name']}  id={pr['id']}  free {pr['free_num']}/{pr['total_num']}")
+        free = ui.dim(f"{pr['free_num']}/{pr['total_num']}")
+        idtag = ui.dim(f"id={pr['id']}")
+        print(f"{ui.bold('◆')} {ui.bold(pr['name'])}  {idtag}  {free}")
         for st in pr["storeys"]:
-            print(f"  ├ {st['name']}  id={st['id']}  free {st['free_num']}/{st['total_num']}")
+            free = ui.dim(f"{st['free_num']}/{st['total_num']}")
+            idtag = ui.dim(f"id={st['id']}")
+            print(f"  ├ {st['name']}  {idtag}  {free}")
             for a in st["areas"]:
-                print(f"  │    {a['id']:>4}  {a['name']}  free={a['free_num']}/{a['total_num']}  [{a['typeName']}]")
+                free = ui.dim(f"{a['free_num']}/{a['total_num']}")
+                typetag = ui.dim(f"[{a['typeName']}]")
+                print(f"  │    {a['id']:>4}  {a['name']}  {free}  {typetag}")
     return 0
 
 
@@ -1875,10 +1897,10 @@ def _prefs_set(args: argparse.Namespace) -> int:
         parts.append(f"default_area_id={resolved}")
     if args.seat_format is not None:
         parts.append(f"seat_format={args.seat_format}")
-    msg = f"OK: 已更新 {CONFIG_FILE} ({', '.join(parts)})"
+    detail = f"{CONFIG_FILE} · {', '.join(parts)}"
     if resolved is not None and resolved != args.default_area_id:
-        msg += f"  ← default_area_id 解析自 '{args.default_area_id}'"
-    print(msg)
+        detail += f" · default_area_id 解析自 '{args.default_area_id}'"
+    ui.ok("已更新配置", detail=detail)
     return 0
 
 
@@ -1915,9 +1937,10 @@ def main(argv: list[str] | None = None) -> int:
         setattr(args, "insecure", True)
     try:
         return int(args.func(args))
-    except (ConfigError, HttpError) as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    except (ConfigError, HttpError, CasLoginError) as e:
+        ui.err(str(e), hint=getattr(e, "hint", None))
         return 2
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
+        print(file=sys.stderr)
+        ui.err("已中断")
         return 130
