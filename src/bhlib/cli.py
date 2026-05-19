@@ -548,7 +548,7 @@ def _redact(value: str, keep: int = 6) -> str:
     value = value or ""
     if len(value) <= keep:
         return "*" * len(value)
-    return ("*" * (len(value) - keep)) + value[-keep:]
+    return f"…{value[-keep:]} ({len(value)} chars)"
 
 
 def _print_api_result(data: object) -> None:
@@ -579,17 +579,23 @@ def _print_api_result(data: object) -> None:
 
 def _cmd_auth_show(args: argparse.Namespace) -> int:
     auth = load_auth()
-    print(json.dumps(
-        {
-            "base_url": auth.base_url,
-            "token": _redact(auth.token),
-            "cookie": _redact(auth.cookie),
-            "username": auth.username,
-            "password_storage": auth.password_storage,
-        },
-        ensure_ascii=False,
-        indent=2,
-    ))
+    info = {
+        "base_url": auth.base_url,
+        "token": _redact(auth.token),
+        "cookie": _redact(auth.cookie),
+        "username": auth.username,
+        "password_storage": auth.password_storage,
+    }
+    if not sys.stdout.isatty():
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    ui.section("认证信息")
+    kw = 8
+    ui.kv("base_url", info["base_url"] or "—", key_width=kw)
+    ui.kv("username", info["username"] or "—", key_width=kw)
+    ui.kv("token", info["token"] or "—", key_width=kw)
+    ui.kv("cookie", info["cookie"] or "—", key_width=kw)
+    ui.kv("密码存储", info["password_storage"] or "—", key_width=kw)
     return 0
 
 
@@ -845,7 +851,10 @@ def _cmd_me(args: argparse.Namespace) -> int:
     try:
         item = _pick_my_active_item(data, prefer_area_id=getattr(args, "prefer_area_id", None))
     except ConfigError:
-        print(json.dumps({"active": False}, ensure_ascii=False, indent=2))
+        if sys.stdout.isatty():
+            ui.tip("当前没有预约")
+        else:
+            print(json.dumps({"active": False}, ensure_ascii=False, indent=2))
         return 0
 
     out = {
@@ -858,7 +867,23 @@ def _cmd_me(args: argparse.Namespace) -> int:
         "beginTime": item.get("beginTime"),
         "endTime": item.get("endTime"),
     }
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    if not sys.stdout.isatty():
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    seat_no = out["seat_no"] or "?"
+    area_full = out["area"] or ""
+    area_short = area_full.split("/")[-1] if area_full else ""
+    title = f"座位 {seat_no}"
+    if area_short:
+        title += f" · {area_short}"
+    ui.section(title)
+    kw = 4
+    ui.kv("状态", str(out["status"] or "—"), key_width=kw)
+    ui.kv("亮度", str(out["brightness"] or "—"), key_width=kw)
+    ui.kv("开始", str(out["beginTime"] or "—"), key_width=kw)
+    ui.kv("结束", str(out["endTime"] or "—"), key_width=kw)
+    ui.kv("设备", f"{out['device_id'] or '—'} · 区域 {out['area_id'] or '—'}", key_width=kw)
     return 0
 
 
