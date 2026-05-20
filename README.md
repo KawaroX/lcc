@@ -5,7 +5,7 @@
 ## 免责声明
 
 - 请确保你的使用符合学校/图书馆的服务条款与相关规定。
-- `token` / `cookie` 存在用户配置目录下的 `bhlib/config.json`（会尝试设为权限 0600）；SSO 密码默认存在系统凭据库，使用 `--plain-password` 时才会明文写入配置。请勿泄露这些信息。
+- `token` / `cookie` 存在用户配置目录下的 `bhlib/config.json`（会尝试设为权限 0600）；装了 `[secure]` 时 SSO 密码进系统凭据库，否则会明文写入配置（启动时会有警告）。请勿泄露这些信息。
 
 ## 安装
 
@@ -15,7 +15,7 @@
 pipx install "bhlib[secure] @ git+https://github.com/KawaroX/bhlib.git"
 ```
 
-`[secure]` 这一组额外依赖（`cryptography` + `keyring`）让密码进系统钥匙串、AES 在进程内完成。Mac / Linux / Windows 都建议带上。
+> ⚠️ **务必带上 `[secure]`**。这一组额外依赖（`cryptography` + `keyring`）让密码进系统钥匙串、AES 在进程内完成。**不带的话也能跑**——bhlib 会自动降级：密码明文写进配置文件、AES 退回到系统 `openssl`，并在 `bhlib login` 时打一条警告。Mac / Linux / Windows 都建议带上 `[secure]`；iOS（a-Shell）装不上这俩库，必须用降级模式（见下文）。
 
 （没装 pipx 的话先 `brew install pipx && pipx ensurepath` / Linux 用 `python3 -m pip install --user pipx` / Windows 用 `python -m pip install --user pipx && python -m pipx ensurepath`。）
 
@@ -61,17 +61,25 @@ pipx install --force "bhlib[secure] @ git+https://github.com/KawaroX/bhlib.git"
 ```bash
 bhlib login
 # 学号: ********
-# 密码: ********
-# OK: 登录成功，配置已写入 <config path>
+# 密码: ********（盲打，无回显）
+# ✓ 登录成功（学号）
+#   · 配置已写入 <config path> · 密码保存到系统凭据库
 ```
 
 之后**从任何目录**跑 `bhlib` 都能用。token 到期时会用保存的账号密码自动续约，不需要任何 `.env` 或环境变量。
 
-默认情况下，密码会保存到系统凭据库（macOS Keychain / Windows Credential Manager / Linux Secret Service 等），`config.json` 只保存 token、cookie、username 和偏好设置。如果当前系统没有可用的凭据库，可显式使用明文兜底：
+**密码存哪里**——取决于装的时候有没有带 `[secure]`：
+
+- 带了 `[secure]`（默认推荐）→ 密码进系统凭据库（macOS Keychain / Windows Credential Manager / Linux Secret Service），`config.json` 只放 token、cookie、username 和偏好设置。
+- 没带 `[secure]`（iOS 或老命令复制粘贴）→ `bhlib login` 检测到 `keyring` 缺失，打一条警告，自动把密码明文写进 `config.json`。功能不受影响。
+
+想明确要求明文（即使 keyring 可用）：
 
 ```bash
 bhlib login --plain-password
 ```
+
+跑完 `bhlib auth show` 可以确认密码是落在 `keyring` 还是 `plain`。
 
 ## 常用命令
 
@@ -84,6 +92,8 @@ bhlib book 131                   # 直接预约 no=131 的座位
 bhlib book --id 276              # 按座位 id 预约
 bhlib book --area 三层西 131      # 指定区域
 bhlib book --all                 # 列出时展示全部座位（含已占用/已预约）
+bhlib book --day 2026-05-21      # 指定日期（默认今天，支持 YYYY-MM-DD 或 YYYYMMDD）
+bhlib book --start 14:00 131     # 指定开始时间（默认当前时间）
 
 bhlib signin                     # 签到（到馆）
 bhlib leave                      # 暂离
@@ -92,17 +102,21 @@ bhlib checkout                   # 离馆
 bhlib swap 131                   # 换座位：先 checkout 当前座位，再 book no=131
 bhlib swap --id 276              # 同上，但按座位 id
 bhlib swap --area 三层西 131     # 指定区域后换到该区域的 131 号
+bhlib swap --day 2026-05-21 131  # 也支持 --day / --start，语义与 book 相同
 
 bhlib seats                      # 默认区域的座位状态（默认输出终端平面图）
 bhlib seats --all                # 显式要求显示全部（与默认行为相同）
 bhlib seats --list               # 以列表形式输出（仅空闲座位）
 bhlib seats --all --list         # 列表形式输出全部座位
 bhlib seats --area 一层西        # 指定区域
+bhlib seats --day 2026-05-21     # 指定日期
+bhlib seats --start 14:00 --end 18:00   # 指定时段（默认当前时间到 23:00）
+bhlib seats --json               # 输出原始 JSON（脚本/管道用）
 bhlib seats --image              # 生成 PNG 平面图（保存到系统临时目录）
 bhlib seats --image --image-path ./seat.png   # 指定图片保存路径
 ```
 
-> **平面图自动 `--all` 说明**：`seats` 默认以**平面图（`--map`）**展示。为了让你一眼看到整块区域的使用情况，只要最终输出是平面图（无论是默认、显式 `--map`，还是配置默认格式为 `map`），系统都会**自动显示全部座位状态**，无需再手动加 `--all**。如果你只想看空闲座位，请使用 `--list`。
+> **平面图自动 `--all` 说明**：`seats` 默认以**平面图（`--map`）**展示。为了让你一眼看到整块区域的使用情况，只要最终输出是平面图（无论是默认、显式 `--map`，还是配置默认格式为 `map`），系统都会**自动显示全部座位状态**，无需再手动加 `--all`。如果你只想看空闲座位，请使用 `--list`。
 
 ![seats 平面图示例](assets/seats-map-demo.png)
 
@@ -120,6 +134,7 @@ bhlib pomo frontend 45           # 前台 45m
 bhlib pomo frontend 1h           # 前台 1 小时（只支持 m / h 后缀）
 bhlib pomo frontend 25 15 60     # 25m，闪 15↔60
 bhlib pomo frontend 25 --flash 15:60   # 同上，flag 写法
+bhlib pomo frontend --cycles 3   # 到达高亮度的次数（默认 2）
 
 bhlib pomo start                 # 后台启动番茄钟守护进程（默认 25m）
 bhlib pomo start 45              # 后台 45m
@@ -129,25 +144,36 @@ bhlib pomo flash                 # 立即闪烁灯光（不启动计时器）
 
 bhlib config --default-area 一层西   # 设置默认区域
 bhlib config --seat-format list      # 设置 seats 默认输出为列表（默认是 map 平面图）
+
+bhlib auth show                  # 查看当前 base_url / token / cookie / username / 密码存储方式（token/cookie 自动脱敏）
+bhlib auth clear                 # 清空配置（删 config.json，顺便把 Keychain 里的密码也清掉）
+bhlib auth set --token ... --cookie ...   # 手动设 token/cookie（一般用不到，给抓包/调试用）
 ```
 
 ## 输出格式
 
-`signin`、`leave`、`checkout`、`light` 以及 `book` 等操作成功后，终端会直接显示友好的文本提示，例如：
+`signin`、`leave`、`checkout`、`light` 以及 `book` 等操作成功后，终端会用结构化输出（TTY 自动上色，`NO_COLOR=1` 关掉色，`BHLIB_FORCE_COLOR=1` 强开）：
 
 ```
-✅ 签到成功
-✅ 临时离开操作成功，请在 2026-04-22 14:08 前返回
-✅ 成功
+✓ 签到成功
+✓ 临时离开操作成功，请在 2026-04-22 14:08 前返回
 ```
 
-如果接口返回错误（`code != 0`），则会显示：
+错误（`code != 0`）：
 
 ```
-❌ [10001] token 已过期
+✗ [10001] token 已过期
+  · 错误码 10001
 ```
 
-需要查看原始 JSON 时，可在 `me` 等支持 `--raw` 的命令中使用该参数。
+警告：
+
+```
+! 未检测到 keyring，密码将明文保存到配置文件
+  · 装系统钥匙串支持请重装：pipx install --force "bhlib[secure]"
+```
+
+需要查看原始 JSON 时，`me` / `seats` 等命令支持 `--raw` 或 `--json`。
 
 ## 按名字指定区域
 
@@ -218,9 +244,9 @@ bhlib --insecure login           # 这次跳过证书校验
 
 ## 安全提示
 
-- 默认情况下，SSO 密码保存在系统凭据库，不写入 `bhlib/config.json`；`bhlib login --plain-password` 会恢复旧的明文保存方式。
-- 配置文件里仍会保存 token / cookie（具体路径取决于系统）。
-- Token 是 JWT，包含学号、姓名等个人信息；贴抓包/日志时请脱敏。
+- 装了 `[secure]` 时，SSO 密码进系统凭据库，不落盘到 `bhlib/config.json`；`--plain-password` 或装不上 `keyring` 时会回退到明文写入配置。
+- 配置文件里仍会保存 token / cookie（具体路径取决于系统；macOS 在 `~/Library/Application Support/bhlib/`，Linux 在 `~/.config/bhlib/`，Windows 在 `%APPDATA%\bhlib\`，iOS a-Shell 在 `~/Documents/.../bhlib/`）。
+- Token 是 JWT，包含学号、姓名等个人信息；贴抓包/日志时请脱敏（`bhlib auth show` 会自动脱敏，可以直接复制给别人看）。
 - 怀疑泄露了 token，重新 `bhlib login` 会让旧 token 作废；必要时修改 SSO 密码。
 
 ## 证书说明
