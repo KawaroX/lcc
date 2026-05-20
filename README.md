@@ -12,8 +12,10 @@
 需要 Python 3.9+。
 
 ```bash
-pipx install git+https://github.com/KawaroX/bhlib.git
+pipx install "bhlib[secure] @ git+https://github.com/KawaroX/bhlib.git"
 ```
+
+`[secure]` 这一组额外依赖（`cryptography` + `keyring`）让密码进系统钥匙串、AES 在进程内完成。Mac / Linux / Windows 都建议带上。
 
 （没装 pipx 的话先 `brew install pipx && pipx ensurepath` / Linux 用 `python3 -m pip install --user pipx` / Windows 用 `python -m pip install --user pipx && python -m pipx ensurepath`。）
 
@@ -29,6 +31,30 @@ pipx install git+https://github.com/KawaroX/bhlib.git
 pipx upgrade bhlib
 pipx uninstall bhlib
 ```
+
+### iOS（a-Shell）
+
+a-Shell 没有 `git`、装不上 `cryptography` / `keyring`，所以走最小依赖路线，直接拉 GitHub 的 zip：
+
+```bash
+pip install --user https://github.com/KawaroX/bhlib/archive/refs/heads/main.zip
+```
+
+跑起来后：
+
+- 密码自动以**明文**保存到 `~/Documents/.../bhlib/config.json`（iOS 沙盒里只有你自己能读，但要心里有数）。`bhlib login` 会先提示"未检测到 keyring"。
+- AES 加解密退回到系统 `openssl`（a-Shell 自带，无需额外操作）。
+- 不用加 `--plain-password`，因为 keyring 不在时会自动走明文。
+
+### 已装了旧版的用户
+
+如果之前是 `pipx install git+...` 装的，升级到 0.5.0 后默认依赖里**不再包含** `cryptography` 和 `keyring`。想保留系统钥匙串支持就强制重装：
+
+```bash
+pipx install --force "bhlib[secure] @ git+https://github.com/KawaroX/bhlib.git"
+```
+
+不重装的话功能还在（密码自动走明文兜底），只是密码不再进 Keychain。
 
 ## 登录（一次即可）
 

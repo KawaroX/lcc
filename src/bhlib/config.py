@@ -92,9 +92,18 @@ def _load_keyring_module():
     except ImportError as e:
         raise ConfigError(
             "未安装 keyring 模块",
-            hint="重装 bhlib 或加 --plain-password 使用明文",
+            hint="重装 bhlib 时带上 [secure] 额外依赖，或加 --plain-password 使用明文",
         ) from e
     return keyring
+
+
+def keyring_available() -> bool:
+    """True iff the `keyring` package can be imported. Used to auto-fall back to plain."""
+    try:
+        import keyring  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _save_password_keyring(*, username: str, password: str) -> None:
@@ -118,6 +127,8 @@ def _load_password_keyring(*, username: str) -> str | None:
 
 
 def _delete_password_keyring(*, username: str) -> None:
+    if not keyring_available():
+        return
     keyring = _load_keyring_module()
     try:
         keyring.delete_password(KEYRING_SERVICE, _keyring_account(username))
@@ -180,6 +191,10 @@ def save_auth(
         storage = (password_storage or data.get("password_storage") or PASSWORD_STORAGE_KEYRING)
         storage = str(storage).strip().lower()
         username_for_password = (username or data.get("username") or "").strip()
+        # Auto-degrade to plain if keyring was requested but the module isn't installed
+        # (e.g. iOS a-Shell with bhlib installed without the [secure] extra).
+        if storage == PASSWORD_STORAGE_KEYRING and not keyring_available():
+            storage = PASSWORD_STORAGE_PLAIN
         if storage == PASSWORD_STORAGE_KEYRING:
             _save_password_keyring(username=username_for_password, password=password)
             data["password_storage"] = PASSWORD_STORAGE_KEYRING
@@ -196,9 +211,13 @@ def save_credentials(*, username: str, password: str) -> None:
     """Persist SSO credentials so the daemon can auto-refresh tokens without env vars."""
     data = _load_file()
     data["username"] = username.strip()
-    _save_password_keyring(username=username, password=password)
-    data["password_storage"] = PASSWORD_STORAGE_KEYRING
-    data.pop("password", None)
+    if keyring_available():
+        _save_password_keyring(username=username, password=password)
+        data["password_storage"] = PASSWORD_STORAGE_KEYRING
+        data.pop("password", None)
+    else:
+        data["password_storage"] = PASSWORD_STORAGE_PLAIN
+        data["password"] = password
     _write(data)
 
 

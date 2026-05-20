@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bhlib"
-version = "0.4.2"
+version = "0.5.0"
 description = "CLI for booking.lib.buaa.edu.cn (BUAA library)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,6 +13,13 @@ authors = [{ name = "kawarox" }]
 dependencies = [
   "certifi>=2024.0.0",
   "platformdirs>=4.0.0",
+]
+
+[project.optional-dependencies]
+# Native deps for secure password storage and in-process AES.
+# Skip on iOS a-Shell (cryptography has no iOS wheel, keyring has no backend);
+# bhlib auto-falls back to system `openssl` for AES and plain-text password storage.
+secure = [
   "cryptography>=39.0.0",
   "keyring>=25.0.0",
 ]

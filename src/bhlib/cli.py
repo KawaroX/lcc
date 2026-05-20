@@ -17,6 +17,7 @@ from .config import (
     clear_auth,
     cache_segment,
     get_cached_segment,
+    keyring_available,
     load_auth,
     load_auth_loose,
     save_auth,
@@ -657,6 +658,13 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         default_area_id = load_auth_loose().default_area_id
     except ConfigError:
         default_area_id = None
+    # Auto-degrade to plain when keyring isn't installed (e.g. iOS a-Shell). Tell the user.
+    want_plain = bool(args.plain_password) or not keyring_available()
+    if want_plain and not args.plain_password:
+        ui.warn(
+            "未检测到 keyring，密码将明文保存到配置文件",
+            hint="装系统钥匙串支持请重装：pipx install --force \"bhlib[secure]\"",
+        )
     save_auth(
         token=result.token,
         cookie=result.cookie,
@@ -665,9 +673,9 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         default_area_id=default_area_id,
         username=username,
         password=password,
-        password_storage=("plain" if args.plain_password else "keyring"),
+        password_storage=("plain" if want_plain else "keyring"),
     )
-    storage_label = "明文配置兜底" if args.plain_password else "系统凭据库"
+    storage_label = "明文配置兜底" if want_plain else "系统凭据库"
     ui.ok(f"登录成功（{username}）", detail=f"配置已写入 {CONFIG_FILE} · 密码保存到{storage_label}")
     return 0
 
