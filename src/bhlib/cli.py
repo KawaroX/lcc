@@ -1912,6 +1912,7 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
         leave = st_acc.get(watch.STATUS_TEMP_LEAVE, 0.0)
         rows.append(
             {
+                "seat_id": sid,
                 "seat_no": seat_no.get(sid) or sid,
                 "use_rate": in_use / total,
                 "in_use_h": in_use / 3600,
@@ -1922,8 +1923,36 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
         )
     rows.sort(key=lambda r: r["use_rate"], reverse=True)
 
-    top = int(getattr(args, "top", 0) or 10)
+    top = int(getattr(args, "top", 10))
     show = rows if top <= 0 else rows[:top]
+
+    # JSON 导出（包含 since/until 元信息，方便回查时间窗）
+    if getattr(args, "json", False):
+        payload = {
+            "since": since.isoformat(timespec="seconds") if since else None,
+            "until": until.isoformat(timespec="seconds"),
+            "sample_seats": len(rows),
+            "rows": show,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    # CSV 导出（适合 Excel / pandas）
+    if getattr(args, "csv", False):
+        import csv as _csv
+        writer = _csv.writer(sys.stdout)
+        writer.writerow(["seat_no", "seat_id", "use_rate", "in_use_h", "free_h", "leave_h", "total_h"])
+        for r in show:
+            writer.writerow([
+                r["seat_no"],
+                r["seat_id"],
+                f"{r['use_rate']:.4f}",
+                f"{r['in_use_h']:.4f}",
+                f"{r['free_h']:.4f}",
+                f"{r['leave_h']:.4f}",
+                f"{r['total_h']:.4f}",
+            ])
+        return 0
 
     ui.section(
         f"座位使用率 · 样本 {len(rows)} 个座位 · 区间 "
@@ -2347,6 +2376,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_stats = sub_watch.add_parser("stats", help="按座位的使用率分析（基于事件历史）")
     pw_stats.add_argument("--since", help="只算这段时间内的事件（默认全部）")
     pw_stats.add_argument("--top", type=int, default=10, help="只显示前 N 条（默认 10；0 表示全部）")
+    pw_stats.add_argument("--json", action="store_true", help="输出 JSON（含 since/until 元信息），便于落盘 / 二次分析")
+    pw_stats.add_argument("--csv", action="store_true", help="输出 CSV，便于 Excel / pandas")
     pw_stats.set_defaults(func=_cmd_watch_stats, insecure=False)
 
     pw_notify = sub_watch.add_parser("notify", help="管理通知开关")
