@@ -142,12 +142,66 @@ bhlib pomo status                # 查看后台番茄钟状态
 bhlib pomo stop                  # 停止后台番茄钟
 bhlib pomo flash                 # 立即闪烁灯光（不启动计时器）
 
+bhlib watch start                # 后台监测默认区域的座位变化（每 60s 一次）
+bhlib watch start --area 三层西 --poll-seconds 90
+bhlib watch status               # 查看 watch 进程 / 快照 / 通知开关
+bhlib watch peek                 # 当前临时离开倒计时（按剩余时间升序）
+bhlib watch stop                 # 停止后台 watch
+bhlib watch log --since 2h       # 回放最近 2 小时的状态变迁
+bhlib watch stats --since 7d     # 基于事件历史按使用率排座位
+bhlib watch notify --on new_free,taken --off temp_leave
+bhlib watch notify --all-off     # 全部静音，只默默记录数据
+bhlib watch ignore add 131 142   # 忽略这些座位的通知（仍记录事件）
+bhlib watch reset --all          # 清空 watch 持久化数据
+
 bhlib config --default-area 一层西   # 设置默认区域
 bhlib config --seat-format list      # 设置 seats 默认输出为列表（默认是 map 平面图）
 
 bhlib auth show                  # 查看当前 base_url / token / cookie / username / 密码存储方式（token/cookie 自动脱敏）
 bhlib auth clear                 # 清空配置（删 config.json，顺便把 Keychain 里的密码也清掉）
 bhlib auth set --token ... --cookie ...   # 手动设 token/cookie（一般用不到，给抓包/调试用）
+```
+
+## 座位监测（watch）
+
+`bhlib watch` 是一个后台守护进程：定时（默认 60s 一次）拉取默认区域的座位列表，跟上一帧 diff，把状态变迁 append 到一个 jsonl 历史文件里，并按"通知开关"决定要不要弹系统通知。
+
+数据落在 `platformdirs.user_data_dir("bhlib")`（macOS：`~/Library/Application Support/bhlib/`）：
+
+- `watch_state.json` — 最新一帧快照，含每个座位"进入当前状态的时间"与到期点；用于 `seats` / `watch peek` 的倒计时
+- `watch_events.jsonl` — 状态变迁 append-only 日志；**永不自动清除**，供后续分析（`bhlib watch stats` 或自己用 `jq` / pandas 处理）
+- `watch.log` — 守护进程自身的日志
+
+通知类型（独立开关，任意组合）：
+
+| 类型 | 触发 | 默认 |
+|---|---|---|
+| `new_free` | 任意 → 空闲（出空位） | 开 |
+| `taken` | 任意 → 使用中（空位被占） | 开 |
+| `temp_leave` | 任意 → 临时离开 | 关 |
+| `expire_soon` | 临时离开座位距到期 ≤ N 分钟（默认 5） | 开 |
+| `self_seat` | 预留：自己座位异常变化 | 关（暂未实现） |
+
+**临时离开倒计时规则**：进入临时离开的**时刻**落在 `[10:30, 13:30]` 或 `[16:30, 19:00]` 闭区间 → 阈值 2 小时；其余时段 → 30 分钟。守护进程对每个临时离开会话只发一次"即将到期"提醒。
+
+当 watch 跑过且当前有座位处于临时离开状态时，**`bhlib seats` 会在地图/列表下方自动追加一段"临时离开倒计时"**，按剩余时间升序；watch 没数据 → `bhlib seats` 行为完全跟以前一样。
+
+忽略名单（`bhlib watch ignore add <no>`）只静音这些座位的通知，事件仍然记录。所有数据要清掉用 `bhlib watch reset --all`（默认要敲 `yes` 确认）。
+
+```bash
+# 第一次用
+bhlib config --default-area 一层西        # 没设的话先选个默认区域
+bhlib watch notify --on new_free,expire_soon --off taken   # 按需打开/关闭通知
+bhlib watch start                          # 拉起守护
+
+# 平时
+bhlib watch status                         # 看进程跑没跑
+bhlib watch peek                           # 看现在哪些座位临时离开
+bhlib seats                                # 平面图下面自动追加倒计时
+bhlib watch log --since 2h                 # 回放最近 2 小时变迁
+
+# 攒了一周后
+bhlib watch stats --since 7d --top 20      # 按使用率给座位排个名
 ```
 
 ## 输出格式

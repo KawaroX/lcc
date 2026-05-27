@@ -1338,13 +1338,37 @@ def _cmd_seat_list(args: argparse.Namespace) -> int:
             ui.ok("已生成平面图", detail=str(img_path))
             return 0
         print(render_seat_map(rows))
+        _render_watch_countdown(str(area_id))
         return 0
     table_rows = [
         [_s(it.get("id")), _s(it.get("no")), _s(it.get("status")), _s(it.get("status_name"))]
         for it in rows
     ]
     ui.table(["ID", "NO", "状态", "名称"], table_rows, aligns=["right", "right", "right", "left"])
+    _render_watch_countdown(str(area_id))
     return 0
+
+
+def _render_watch_countdown(area_id: str) -> None:
+    """如果 watch 有数据且该区域有临时离开座位，按剩余时间升序追加一段输出。"""
+    try:
+        from . import watch
+    except Exception:  # noqa: BLE001
+        return
+    items = watch.temp_leave_countdown(area_id=area_id)
+    if not items:
+        return
+    print()  # 空行隔开
+    ui.section(f"临时离开倒计时 · {len(items)} 个（watch 数据）")
+    rows = [
+        [
+            it["seat_no"] or it["seat_id"],
+            _format_remaining_seconds(it["remaining_seconds"]),
+            it["expire_at"].strftime("%H:%M"),
+        ]
+        for it in items
+    ]
+    ui.table(["座位", "剩余", "到期"], rows, aligns=["right", "right", "right"])
 
 
 def _cmd_book(args: argparse.Namespace) -> int:
@@ -1608,6 +1632,450 @@ def _cmd_pomo_daemon(args: argparse.Namespace) -> int:
     return daemon_main(args)
 
 
+# ============================================================ watch ===========
+
+
+def _parse_since_to_datetime(v: str | None) -> _dt.datetime | None:
+    if not v:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    now = _dt.datetime.now()
+    if s.endswith("d"):
+        try:
+            return now - _dt.timedelta(days=float(s[:-1]))
+        except ValueError as e:
+            raise ConfigError(f"--since 无法识别：{v}") from e
+    if s.endswith("h"):
+        try:
+            return now - _dt.timedelta(hours=float(s[:-1]))
+        except ValueError as e:
+            raise ConfigError(f"--since 无法识别：{v}") from e
+    if s.endswith("m"):
+        try:
+            return now - _dt.timedelta(minutes=float(s[:-1]))
+        except ValueError as e:
+            raise ConfigError(f"--since 无法识别：{v}") from e
+    # 尝试 ISO
+    try:
+        return _dt.datetime.fromisoformat(s)
+    except ValueError as e:
+        raise ConfigError(f"--since 应为 1h/30m/7d 或 ISO 时间：{v}") from e
+
+
+def _format_remaining_seconds(s: int) -> str:
+    if s <= 0:
+        return "已过期"
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    if m < 60:
+        return f"{m}min"
+    h, mm = divmod(m, 60)
+    return f"{h}h{mm:02d}min"
+
+
+def _cmd_watch_start(args: argparse.Namespace) -> int:
+    from . import watch
+    from .config import (
+        load_watch_config,
+        load_watch_daemon_state,
+        save_watch_daemon_state,
+        clear_watch_daemon_state,
+    )
+
+    # 已有进程？
+    state = load_watch_daemon_state()
+    if state:
+        pid = state.get("pid")
+        if isinstance(pid, int) and watch.is_process_alive(pid):
+            ui.warn(f"watch 已在运行 · PID {pid} · area {state.get('area_id')}")
+            ui.tip("bhlib watch status / bhlib watch stop")
+            return 0
+        clear_watch_daemon_state()
+
+    auth = load_auth_loose()
+    area_id = _resolve_area_id_maybe(getattr(args, "area_id", None), args, auth=auth)
+    if not area_id:
+        area_id = auth.default_area_id
+    if not area_id:
+        raise ConfigError(
+            "未指定 watch 区域",
+            hint=["传 --area，或先用 bhlib config --default-area X 设置默认区域"],
+        )
+
+    cfg = load_watch_config()
+    poll = int(getattr(args, "poll_seconds", None) or cfg["poll_seconds"])
+    if poll < 10:
+        raise ConfigError("--poll-seconds 不能小于 10")
+
+    pid = watch.spawn_daemon(
+        area_id=str(area_id),
+        poll_seconds=poll,
+        timeout=float(getattr(args, "timeout", 15.0)),
+        insecure=bool(getattr(args, "insecure", False)),
+        use_proxy=_effective_use_proxy(args),
+    )
+    save_watch_daemon_state(
+        {
+            "pid": pid,
+            "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "area_id": str(area_id),
+            "poll_seconds": poll,
+        }
+    )
+    ui.ok(f"watch 已启动 · PID {pid}")
+    ui.kv("区域", str(area_id), key_width=8)
+    ui.kv("间隔", f"{poll}s", key_width=8)
+    on_types = [k for k, v in cfg["notify"].items() if v]
+    ui.kv("通知", ", ".join(on_types) if on_types else "全部关闭（仅记录）", key_width=8)
+    if cfg["ignore_seats"]:
+        ui.kv("忽略", ", ".join(cfg["ignore_seats"]), key_width=8)
+    ui.tip("bhlib watch status / bhlib watch peek / bhlib watch log")
+    return 0
+
+
+def _cmd_watch_stop(args: argparse.Namespace) -> int:
+    from . import watch
+    from .config import (
+        load_watch_daemon_state,
+        clear_watch_daemon_state,
+    )
+
+    state = load_watch_daemon_state()
+    if not state:
+        ui.tip("没有正在运行的 watch")
+        return 0
+    pid = state.get("pid")
+    if not isinstance(pid, int):
+        clear_watch_daemon_state()
+        ui.warn("状态中 PID 无效，已清理")
+        return 0
+    if watch.is_process_alive(pid):
+        if watch.signal_stop(pid):
+            ui.ok(f"已发送 SIGTERM 给 PID {pid}")
+        else:
+            ui.warn("发送停止信号失败（可能进程已退出）")
+    else:
+        ui.tip(f"PID {pid} 已不存在")
+    clear_watch_daemon_state()
+    return 0
+
+
+def _cmd_watch_status(args: argparse.Namespace) -> int:
+    from . import watch
+    from .config import load_watch_daemon_state, load_watch_config
+
+    state = load_watch_daemon_state()
+    cfg = load_watch_config()
+    if not state:
+        ui.tip("watch 未运行")
+        ui.kv("通知设置", ", ".join(k for k, v in cfg["notify"].items() if v) or "（全部关闭）", key_width=10)
+        if cfg["ignore_seats"]:
+            ui.kv("忽略名单", ", ".join(cfg["ignore_seats"]), key_width=10)
+        return 0
+
+    pid = state.get("pid")
+    alive = isinstance(pid, int) and watch.is_process_alive(pid)
+    ui.section("watch 状态")
+    ui.kv("PID", str(pid), key_width=10)
+    ui.kv("区域", str(state.get("area_id") or "—"), key_width=10)
+    ui.kv("启动时间", str(state.get("started_at") or "—"), key_width=10)
+    ui.kv("轮询间隔", f"{state.get('poll_seconds')}s", key_width=10)
+    ui.kv("进程", "运行中" if alive else "已退出", key_width=10)
+
+    snap = watch.load_state()
+    if snap:
+        ui.kv("快照更新", str(snap.get("updated_at") or "—"), key_width=10)
+        ui.kv("观测次数", str(snap.get("tick_count") or 0), key_width=10)
+        ui.kv("座位数", str(len(snap.get("seats") or {})), key_width=10)
+
+    on = [k for k, v in cfg["notify"].items() if v]
+    ui.kv("通知开关", ", ".join(on) if on else "（全部关闭）", key_width=10)
+    if cfg["ignore_seats"]:
+        ui.kv("忽略名单", ", ".join(cfg["ignore_seats"]), key_width=10)
+
+    ev_path = watch.events_file()
+    if ev_path.exists():
+        ui.kv("事件文件", f"{ev_path} ({ev_path.stat().st_size} B)", key_width=10)
+    if not alive:
+        ui.warn("进程已退出，bhlib watch stop 清理状态", hint=None)
+    return 0
+
+
+def _cmd_watch_peek(args: argparse.Namespace) -> int:
+    from . import watch
+    from .config import load_watch_daemon_state
+
+    state = load_watch_daemon_state()
+    snap = watch.load_state()
+    if not snap:
+        ui.tip("尚无 watch 快照（先 bhlib watch start）")
+        return 0
+    area_id = str(snap.get("area_id") or "")
+    items = watch.temp_leave_countdown(area_id=area_id)
+    ui.section(f"临时离开倒计时 · area {area_id}")
+    if not items:
+        ui.tip("当前没有处于临时离开状态的座位")
+        return 0
+    rows = [
+        [
+            it["seat_no"] or it["seat_id"],
+            _format_remaining_seconds(it["remaining_seconds"]),
+            it["expire_at"].strftime("%H:%M"),
+            (it.get("since") or "—")[-8:],
+        ]
+        for it in items
+    ]
+    ui.table(["座位", "剩余", "到期", "起始"], rows, aligns=["right", "right", "right", "right"])
+    if state:
+        ui.tip(f"快照更新于 {snap.get('updated_at')}")
+    return 0
+
+
+def _cmd_watch_log(args: argparse.Namespace) -> int:
+    from . import watch
+
+    since = _parse_since_to_datetime(getattr(args, "since", None))
+    limit = int(getattr(args, "limit", 0) or 0)
+    rows: list[dict] = list(watch.iter_events(since=since))
+    if limit > 0:
+        rows = rows[-limit:]
+    if getattr(args, "json", False):
+        for r in rows:
+            print(json.dumps(r, ensure_ascii=False))
+        return 0
+    if not rows:
+        ui.tip("没有匹配的事件")
+        return 0
+    table_rows = [
+        [
+            r.get("ts", "")[-8:],
+            r.get("seat_no") or r.get("seat_id") or "",
+            f"{watch.STATUS_NAME.get(r.get('from') or '', r.get('from') or '?')}",
+            "→",
+            f"{watch.STATUS_NAME.get(r.get('to') or '', r.get('to') or '?')}",
+        ]
+        for r in rows
+    ]
+    ui.table(["时间", "座位", "前", "", "后"], table_rows, aligns=["right", "right", "right", "left", "left"])
+    return 0
+
+
+def _cmd_watch_stats(args: argparse.Namespace) -> int:
+    from . import watch
+
+    since = _parse_since_to_datetime(getattr(args, "since", None))
+    until = _dt.datetime.now()
+    # 状态机：跟踪每个座位最近一次进入某状态的时间，累计该状态的持续时间。
+    current: dict[str, tuple[str, _dt.datetime]] = {}
+    accum: dict[str, dict[str, float]] = {}
+    seat_no: dict[str, str] = {}
+
+    def _accrue(seat_id: str, at: _dt.datetime) -> None:
+        st, since_ts = current.get(seat_id, (None, None))
+        if st is None or since_ts is None:
+            return
+        delta = (at - since_ts).total_seconds()
+        if delta <= 0:
+            return
+        accum.setdefault(seat_id, {}).setdefault(st, 0.0)
+        accum[seat_id][st] += delta
+
+    for ev in watch.iter_events(since=since):
+        try:
+            ts = _dt.datetime.fromisoformat(ev.get("ts") or "")
+        except ValueError:
+            continue
+        sid = str(ev.get("seat_id") or "")
+        if not sid:
+            continue
+        if ev.get("seat_no"):
+            seat_no[sid] = str(ev["seat_no"])
+        _accrue(sid, ts)
+        current[sid] = (str(ev.get("to") or ""), ts)
+
+    # 收尾：把"当前正在持续的那一段"按 until 截断累计进去
+    for sid in list(current.keys()):
+        _accrue(sid, until)
+
+    if not accum:
+        ui.tip("没有可分析的数据（先让 watch 跑一段时间）")
+        return 0
+
+    rows = []
+    for sid, st_acc in accum.items():
+        total = sum(st_acc.values()) or 1.0
+        in_use = st_acc.get(watch.STATUS_IN_USE, 0.0)
+        free = st_acc.get(watch.STATUS_FREE, 0.0)
+        leave = st_acc.get(watch.STATUS_TEMP_LEAVE, 0.0)
+        rows.append(
+            {
+                "seat_no": seat_no.get(sid) or sid,
+                "use_rate": in_use / total,
+                "in_use_h": in_use / 3600,
+                "free_h": free / 3600,
+                "leave_h": leave / 3600,
+                "total_h": total / 3600,
+            }
+        )
+    rows.sort(key=lambda r: r["use_rate"], reverse=True)
+
+    top = int(getattr(args, "top", 0) or 10)
+    show = rows if top <= 0 else rows[:top]
+
+    ui.section(
+        f"座位使用率 · 样本 {len(rows)} 个座位 · 区间 "
+        f"{(since.isoformat(timespec='seconds') if since else '全部')} → {until.isoformat(timespec='seconds')}"
+    )
+    table = [
+        [
+            r["seat_no"],
+            f"{r['use_rate'] * 100:.1f}%",
+            f"{r['in_use_h']:.2f}",
+            f"{r['free_h']:.2f}",
+            f"{r['leave_h']:.2f}",
+            f"{r['total_h']:.2f}",
+        ]
+        for r in show
+    ]
+    ui.table(
+        ["座位", "使用率", "使用(h)", "空闲(h)", "暂离(h)", "总时(h)"],
+        table,
+        aligns=["right", "right", "right", "right", "right", "right"],
+    )
+    if top > 0 and len(rows) > top:
+        ui.tip(f"仅显示前 {top} 条（共 {len(rows)}），加 --top 0 查看全部")
+    return 0
+
+
+def _cmd_watch_notify(args: argparse.Namespace) -> int:
+    from .config import load_watch_config, save_watch_config, WATCH_NOTIFY_TYPES
+
+    cfg = load_watch_config()
+    changed = False
+    if getattr(args, "all_on", False):
+        for k in WATCH_NOTIFY_TYPES:
+            cfg["notify"][k] = True
+        changed = True
+    if getattr(args, "all_off", False):
+        for k in WATCH_NOTIFY_TYPES:
+            cfg["notify"][k] = False
+        changed = True
+
+    def _split(csv: str | None) -> list[str]:
+        if not csv:
+            return []
+        return [x.strip() for x in csv.split(",") if x.strip()]
+
+    for k in _split(getattr(args, "on", None)):
+        if k not in WATCH_NOTIFY_TYPES:
+            raise ConfigError(
+                f"未知通知类型：{k}",
+                hint=[f"可用：{', '.join(WATCH_NOTIFY_TYPES)}"],
+            )
+        cfg["notify"][k] = True
+        changed = True
+    for k in _split(getattr(args, "off", None)):
+        if k not in WATCH_NOTIFY_TYPES:
+            raise ConfigError(
+                f"未知通知类型：{k}",
+                hint=[f"可用：{', '.join(WATCH_NOTIFY_TYPES)}"],
+            )
+        cfg["notify"][k] = False
+        changed = True
+
+    warn = getattr(args, "expire_warn_minutes", None)
+    if warn is not None:
+        if int(warn) < 1:
+            raise ConfigError("--expire-warn-minutes 不能小于 1")
+        cfg["expire_warn_minutes"] = int(warn)
+        changed = True
+
+    if changed:
+        save_watch_config(cfg)
+        ui.ok("watch 通知设置已更新")
+
+    ui.section("当前通知设置")
+    for k in WATCH_NOTIFY_TYPES:
+        ui.kv(k, "开" if cfg["notify"][k] else "关", key_width=12)
+    ui.kv("expire 预警", f"{cfg['expire_warn_minutes']} 分钟", key_width=12)
+    return 0
+
+
+def _cmd_watch_ignore(args: argparse.Namespace) -> int:
+    from .config import load_watch_config, save_watch_config
+
+    cfg = load_watch_config()
+    op = getattr(args, "ignore_op", None)
+    seats = list(getattr(args, "seats", None) or [])
+
+    if op == "list" or op is None:
+        if not cfg["ignore_seats"]:
+            ui.tip("忽略名单为空")
+        else:
+            ui.section("忽略名单（不通知，仍记录）")
+            for s in cfg["ignore_seats"]:
+                print(f"  · {s}")
+        return 0
+
+    if not seats:
+        raise ConfigError(f"watch ignore {op} 至少需要一个座位号")
+
+    cur = set(cfg["ignore_seats"])
+    if op == "add":
+        cur.update(s.strip() for s in seats if s.strip())
+    elif op == "rm":
+        cur.difference_update(s.strip() for s in seats if s.strip())
+    else:
+        raise ConfigError(f"未知子命令：{op}")
+    cfg["ignore_seats"] = sorted(cur)
+    save_watch_config(cfg)
+    ui.ok(f"已更新 · 当前忽略 {len(cfg['ignore_seats'])} 个座位")
+    if cfg["ignore_seats"]:
+        ui.tip(", ".join(cfg["ignore_seats"]))
+    return 0
+
+
+def _cmd_watch_reset(args: argparse.Namespace) -> int:
+    from . import watch
+
+    target_state = bool(getattr(args, "reset_state", False))
+    target_events = bool(getattr(args, "reset_events", False))
+    if getattr(args, "reset_all", False):
+        target_state = True
+        target_events = True
+    if not (target_state or target_events):
+        raise ConfigError(
+            "请指定要清除的内容",
+            hint=["--state（仅快照）/ --events（仅历史）/ --all（全部）"],
+        )
+
+    if not getattr(args, "yes", False):
+        what = []
+        if target_state:
+            what.append("watch_state.json")
+        if target_events:
+            what.append("watch_events.jsonl")
+        ui.warn(f"将删除：{', '.join(what)}")
+        confirm = input("确认？输入 yes 继续: ").strip().lower()
+        if confirm != "yes":
+            ui.tip("取消")
+            return 0
+
+    if target_state and watch.state_file().exists():
+        watch.state_file().unlink()
+        ui.ok(f"已删除 {watch.state_file()}")
+    if target_events and watch.events_file().exists():
+        watch.events_file().unlink()
+        ui.ok(f"已删除 {watch.events_file()}")
+    return 0
+
+
+def _cmd_watch_daemon(args: argparse.Namespace) -> int:
+    from .watch_daemon import main as daemon_main
+    return daemon_main(args)
 
 
 def _cmd_seats(args: argparse.Namespace) -> int:
@@ -1826,6 +2294,72 @@ def build_parser() -> argparse.ArgumentParser:
     p_pomo_daemon.add_argument("--proxy", action="store_true", help=argparse.SUPPRESS)
     p_pomo_daemon.add_argument("--record-brightness", action="store_true", help=argparse.SUPPRESS)
     p_pomo_daemon.set_defaults(func=_cmd_pomo_daemon, insecure=False)
+
+    # === watch ===
+    p_watch = sub.add_parser("watch", help="座位变化监测：后台轮询 + diff + 通知")
+    sub_watch = p_watch.add_subparsers(dest="watch_cmd", title="子命令", required=True)
+
+    pw_start = sub_watch.add_parser("start", help="启动后台监测守护进程")
+    pw_start.add_argument("--area", dest="area_id", help="区域（id 或名字；默认用配置里的 default-area）")
+    pw_start.add_argument("--poll-seconds", type=int, default=None, help="轮询间隔（秒，默认 60）")
+    pw_start.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    pw_start.set_defaults(func=_cmd_watch_start, insecure=False)
+
+    pw_stop = sub_watch.add_parser("stop", help="停止后台监测进程")
+    pw_stop.set_defaults(func=_cmd_watch_stop, insecure=False)
+
+    pw_status = sub_watch.add_parser("status", help="查看后台监测状态")
+    pw_status.set_defaults(func=_cmd_watch_status, insecure=False)
+
+    pw_peek = sub_watch.add_parser("peek", help="显示临时离开倒计时（按剩余升序）")
+    pw_peek.set_defaults(func=_cmd_watch_peek, insecure=False)
+
+    pw_log = sub_watch.add_parser("log", help="回放事件历史")
+    pw_log.add_argument("--since", help="时间窗口（1h/30m/7d/ISO；默认全部）")
+    pw_log.add_argument("--limit", type=int, default=100, help="最多展示条数（默认 100；0 表示不限）")
+    pw_log.add_argument("--json", action="store_true", help="输出原始 JSON 行")
+    pw_log.set_defaults(func=_cmd_watch_log, insecure=False)
+
+    pw_stats = sub_watch.add_parser("stats", help="按座位的使用率分析（基于事件历史）")
+    pw_stats.add_argument("--since", help="只算这段时间内的事件（默认全部）")
+    pw_stats.add_argument("--top", type=int, default=10, help="只显示前 N 条（默认 10；0 表示全部）")
+    pw_stats.set_defaults(func=_cmd_watch_stats, insecure=False)
+
+    pw_notify = sub_watch.add_parser("notify", help="管理通知开关")
+    pw_notify.add_argument("--on", help="开启这些类型（逗号分隔，如 new_free,taken）")
+    pw_notify.add_argument("--off", help="关闭这些类型（逗号分隔）")
+    pw_notify.add_argument("--all-on", action="store_true", help="全部开启")
+    pw_notify.add_argument("--all-off", action="store_true", help="全部关闭")
+    pw_notify.add_argument("--expire-warn-minutes", type=int, default=None, help="临时离开到期预警提前分钟数")
+    pw_notify.set_defaults(func=_cmd_watch_notify, insecure=False)
+
+    pw_ignore = sub_watch.add_parser("ignore", help="忽略名单（仅静音通知，仍记录事件）")
+    sub_ig = pw_ignore.add_subparsers(dest="ignore_op", title="操作")
+    pw_ig_add = sub_ig.add_parser("add", help="加入忽略名单")
+    pw_ig_add.add_argument("seats", nargs="+", help="座位号（no）")
+    pw_ig_add.set_defaults(func=_cmd_watch_ignore, insecure=False, ignore_op="add")
+    pw_ig_rm = sub_ig.add_parser("rm", help="从忽略名单移除")
+    pw_ig_rm.add_argument("seats", nargs="+", help="座位号（no）")
+    pw_ig_rm.set_defaults(func=_cmd_watch_ignore, insecure=False, ignore_op="rm")
+    pw_ig_list = sub_ig.add_parser("list", help="查看忽略名单")
+    pw_ig_list.set_defaults(func=_cmd_watch_ignore, insecure=False, ignore_op="list")
+    pw_ignore.set_defaults(func=_cmd_watch_ignore, insecure=False, ignore_op=None, seats=[])
+
+    pw_reset = sub_watch.add_parser("reset", help="清除 watch 持久化数据")
+    pw_reset.add_argument("--state", dest="reset_state", action="store_true", help="清除快照")
+    pw_reset.add_argument("--events", dest="reset_events", action="store_true", help="清除历史事件")
+    pw_reset.add_argument("--all", dest="reset_all", action="store_true", help="清除快照 + 历史")
+    pw_reset.add_argument("-y", "--yes", action="store_true", help="跳过确认")
+    pw_reset.set_defaults(func=_cmd_watch_reset, insecure=False)
+
+    # === hidden: watch-daemon (internal use only) ===
+    p_watch_daemon = sub.add_parser("watch-daemon", add_help=False)
+    p_watch_daemon.add_argument("--area-id", required=True, help=argparse.SUPPRESS)
+    p_watch_daemon.add_argument("--poll-seconds", type=int, default=60, help=argparse.SUPPRESS)
+    p_watch_daemon.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+    p_watch_daemon.add_argument("--insecure", action="store_true", help=argparse.SUPPRESS)
+    p_watch_daemon.add_argument("--proxy", action="store_true", help=argparse.SUPPRESS)
+    p_watch_daemon.set_defaults(func=_cmd_watch_daemon, insecure=False)
 
     # === config ===
     p_config = sub.add_parser("config", help=f"写入默认值到 {CONFIG_FILE}（如默认区域）")

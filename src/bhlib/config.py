@@ -22,11 +22,14 @@ try:
     # - macOS:   ~/Library/Application Support/bhlib
     # - Linux:   ~/.config/bhlib (or $XDG_CONFIG_HOME/bhlib)
     from platformdirs import user_config_path as _user_config_path
+    from platformdirs import user_data_path as _user_data_path
 
     CONFIG_DIR = _user_config_path("bhlib", roaming=True)
+    DATA_DIR = _user_data_path("bhlib", roaming=False)
 except Exception:  # pragma: no cover
     # Fallback for environments without platformdirs.
     CONFIG_DIR = LEGACY_CONFIG_DIR
+    DATA_DIR = LEGACY_CONFIG_DIR
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -377,6 +380,78 @@ def clear_pomo_state() -> None:
     data = _load_file()
     if "pomo_daemon" in data:
         del data["pomo_daemon"]
+        _write(data)
+
+
+WATCH_NOTIFY_TYPES = ("new_free", "taken", "temp_leave", "expire_soon", "self_seat")
+WATCH_DEFAULTS = {
+    "poll_seconds": 60,
+    "expire_warn_minutes": 5,
+    "notify": {
+        "new_free": True,
+        "taken": True,
+        "temp_leave": False,
+        "expire_soon": True,
+        "self_seat": False,
+    },
+    "ignore_seats": [],
+}
+
+
+def load_watch_config() -> dict:
+    """Return a normalized watch config dict, merging defaults with stored values."""
+    data = _load_file()
+    raw = data.get("watch")
+    if not isinstance(raw, dict):
+        raw = {}
+    notify_raw = raw.get("notify") if isinstance(raw.get("notify"), dict) else {}
+    notify = {
+        k: bool(notify_raw.get(k, WATCH_DEFAULTS["notify"][k]))
+        for k in WATCH_NOTIFY_TYPES
+    }
+    ignore = raw.get("ignore_seats")
+    if not isinstance(ignore, list):
+        ignore = []
+    return {
+        "poll_seconds": int(raw.get("poll_seconds") or WATCH_DEFAULTS["poll_seconds"]),
+        "expire_warn_minutes": int(
+            raw.get("expire_warn_minutes") or WATCH_DEFAULTS["expire_warn_minutes"]
+        ),
+        "notify": notify,
+        "ignore_seats": [str(x).strip() for x in ignore if str(x).strip()],
+    }
+
+
+def save_watch_config(cfg: dict) -> None:
+    """Persist watch config; preserves other top-level fields."""
+    data = _load_file()
+    data["watch"] = {
+        "poll_seconds": int(cfg["poll_seconds"]),
+        "expire_warn_minutes": int(cfg["expire_warn_minutes"]),
+        "notify": {k: bool(cfg["notify"].get(k, False)) for k in WATCH_NOTIFY_TYPES},
+        "ignore_seats": list(cfg.get("ignore_seats") or []),
+    }
+    _write(data)
+
+
+def save_watch_daemon_state(state: dict) -> None:
+    data = _load_file()
+    data["watch_daemon"] = state
+    _write(data)
+
+
+def load_watch_daemon_state() -> dict | None:
+    data = _load_file()
+    state = data.get("watch_daemon")
+    if isinstance(state, dict):
+        return state
+    return None
+
+
+def clear_watch_daemon_state() -> None:
+    data = _load_file()
+    if "watch_daemon" in data:
+        del data["watch_daemon"]
         _write(data)
 
 
