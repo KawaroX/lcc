@@ -1954,6 +1954,29 @@ def _cmd_watch_notify(args: argparse.Namespace) -> int:
     from .config import load_watch_config, save_watch_config, WATCH_NOTIFY_TYPES
 
     cfg = load_watch_config()
+
+    if getattr(args, "edit", False):
+        from .watch_tui import edit_notify_config
+
+        updated = edit_notify_config(cfg)
+        if updated is None:
+            # 可能是用户取消，也可能是当前环境不支持 TUI
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise ConfigError(
+                    "当前环境不是交互式终端，无法使用 --edit",
+                    hint=["改用 --on / --off / --expire-warn-minutes"],
+                )
+            ui.tip("已取消（未保存）")
+        else:
+            cfg = updated
+            save_watch_config(cfg)
+            ui.ok("watch 通知设置已更新")
+        ui.section("当前通知设置")
+        for k in WATCH_NOTIFY_TYPES:
+            ui.kv(k, "开" if cfg["notify"][k] else "关", key_width=12)
+        ui.kv("expire 预警", f"{cfg['expire_warn_minutes']} 分钟", key_width=12)
+        return 0
+
     changed = False
     if getattr(args, "all_on", False):
         for k in WATCH_NOTIFY_TYPES:
@@ -1988,9 +2011,10 @@ def _cmd_watch_notify(args: argparse.Namespace) -> int:
 
     warn = getattr(args, "expire_warn_minutes", None)
     if warn is not None:
-        if int(warn) < 1:
-            raise ConfigError("--expire-warn-minutes 不能小于 1")
-        cfg["expire_warn_minutes"] = int(warn)
+        w = int(warn)
+        if not (0 <= w <= 30):
+            raise ConfigError("--expire-warn-minutes 取值范围 0-30")
+        cfg["expire_warn_minutes"] = w
         changed = True
 
     if changed:
@@ -2326,11 +2350,12 @@ def build_parser() -> argparse.ArgumentParser:
     pw_stats.set_defaults(func=_cmd_watch_stats, insecure=False)
 
     pw_notify = sub_watch.add_parser("notify", help="管理通知开关")
+    pw_notify.add_argument("--edit", action="store_true", help="打开交互式编辑器（↑↓ ←→ 操作）")
     pw_notify.add_argument("--on", help="开启这些类型（逗号分隔，如 new_free,taken）")
     pw_notify.add_argument("--off", help="关闭这些类型（逗号分隔）")
     pw_notify.add_argument("--all-on", action="store_true", help="全部开启")
     pw_notify.add_argument("--all-off", action="store_true", help="全部关闭")
-    pw_notify.add_argument("--expire-warn-minutes", type=int, default=None, help="临时离开到期预警提前分钟数")
+    pw_notify.add_argument("--expire-warn-minutes", type=int, default=None, help="临时离开到期预警提前分钟数（0-30）")
     pw_notify.set_defaults(func=_cmd_watch_notify, insecure=False)
 
     pw_ignore = sub_watch.add_parser("ignore", help="忽略名单（仅静音通知，仍记录事件）")
