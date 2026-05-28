@@ -1866,24 +1866,41 @@ def _cmd_watch_log(args: argparse.Namespace) -> int:
 def _cmd_watch_stats(args: argparse.Namespace) -> int:
     from . import watch
 
-    since = _parse_since_to_datetime(getattr(args, "since", None))
     until = _dt.datetime.now()
-    # 状态机：跟踪每个座位最近一次进入某状态的时间，累计该状态的持续时间。
+    since_arg = _parse_since_to_datetime(getattr(args, "since", None))
+
+    # 把整段历史读出来；体量不大（一年也才几十万行），materialize 起来方便算
+    all_events: list[dict] = list(watch.iter_events())
+    state = watch.load_state() or {}
+    state_seats = (state.get("seats") if isinstance(state.get("seats"), dict) else {}) or {}
+
+    # 决定窗口起点：--since 优先；否则用 watch 第一次启动的时间；再否则用最早事件
+    if since_arg is not None:
+        window_start = since_arg
+    else:
+        fsa = state.get("first_seen_at")
+        window_start = None
+        if isinstance(fsa, str):
+            try:
+                window_start = _dt.datetime.fromisoformat(fsa)
+            except ValueError:
+                window_start = None
+        if window_start is None and all_events:
+            try:
+                window_start = _dt.datetime.fromisoformat(all_events[0].get("ts") or "")
+            except ValueError:
+                window_start = None
+
+    if window_start is None:
+        ui.tip("没有可分析的数据（先让 watch 跑一段时间）")
+        return 0
+
+    # current[sid] = (status, since_ts)；accum[sid][status] = 秒
     current: dict[str, tuple[str, _dt.datetime]] = {}
     accum: dict[str, dict[str, float]] = {}
     seat_no: dict[str, str] = {}
 
-    def _accrue(seat_id: str, at: _dt.datetime) -> None:
-        st, since_ts = current.get(seat_id, (None, None))
-        if st is None or since_ts is None:
-            return
-        delta = (at - since_ts).total_seconds()
-        if delta <= 0:
-            return
-        accum.setdefault(seat_id, {}).setdefault(st, 0.0)
-        accum[seat_id][st] += delta
-
-    for ev in watch.iter_events(since=since):
+    for ev in all_events:
         try:
             ts = _dt.datetime.fromisoformat(ev.get("ts") or "")
         except ValueError:
@@ -1893,12 +1910,57 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
             continue
         if ev.get("seat_no"):
             seat_no[sid] = str(ev["seat_no"])
-        _accrue(sid, ts)
-        current[sid] = (str(ev.get("to") or ""), ts)
+        to_st = str(ev.get("to") or "")
 
-    # 收尾：把"当前正在持续的那一段"按 until 截断累计进去
-    for sid in list(current.keys()):
-        _accrue(sid, until)
+        if ts < window_start:
+            # 窗口前的事件：只用来"知道窗口起点时这个座位的状态"，不累加时长
+            current[sid] = (to_st, window_start)
+            continue
+
+        if sid not in current:
+            # 窗口内的第一个事件，且窗口前没见过它
+            # → 用事件自带的 from 字段还原"窗口起点到此刻"的状态
+            from_st = str(ev.get("from") or "")
+            if from_st:
+                delta = (ts - window_start).total_seconds()
+                if delta > 0:
+                    accum.setdefault(sid, {}).setdefault(from_st, 0.0)
+                    accum[sid][from_st] += delta
+            current[sid] = (to_st, ts)
+            continue
+
+        # 常规累加：上一状态从 prev_ts 持续到现在
+        prev_st, prev_ts = current[sid]
+        delta = (ts - prev_ts).total_seconds()
+        if delta > 0:
+            accum.setdefault(sid, {}).setdefault(prev_st, 0.0)
+            accum[sid][prev_st] += delta
+        current[sid] = (to_st, ts)
+
+    # 收尾：把最后一段 (最后事件 → until) 累加
+    for sid, (st, ts) in current.items():
+        if not st:
+            continue
+        delta = (until - ts).total_seconds()
+        if delta > 0:
+            accum.setdefault(sid, {}).setdefault(st, 0.0)
+            accum[sid][st] += delta
+
+    # 整段窗口里没出现过事件的座位：用 state 的当前状态填满整段
+    full_window = (until - window_start).total_seconds()
+    for sid, sd in state_seats.items():
+        if sid in accum:
+            continue
+        if not isinstance(sd, dict):
+            continue
+        st = sd.get("status")
+        if not st:
+            continue
+        if sd.get("no"):
+            seat_no[sid] = str(sd["no"])
+        if full_window > 0:
+            accum.setdefault(sid, {}).setdefault(str(st), 0.0)
+            accum[sid][str(st)] += full_window
 
     if not accum:
         ui.tip("没有可分析的数据（先让 watch 跑一段时间）")
@@ -1910,6 +1972,7 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
         in_use = st_acc.get(watch.STATUS_IN_USE, 0.0)
         free = st_acc.get(watch.STATUS_FREE, 0.0)
         leave = st_acc.get(watch.STATUS_TEMP_LEAVE, 0.0)
+        reserved = st_acc.get(watch.STATUS_RESERVED, 0.0)
         rows.append(
             {
                 "seat_id": sid,
@@ -1918,6 +1981,7 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
                 "in_use_h": in_use / 3600,
                 "free_h": free / 3600,
                 "leave_h": leave / 3600,
+                "reserved_h": reserved / 3600,
                 "total_h": total / 3600,
             }
         )
@@ -1929,7 +1993,7 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
     # JSON 导出（包含 since/until 元信息，方便回查时间窗）
     if getattr(args, "json", False):
         payload = {
-            "since": since.isoformat(timespec="seconds") if since else None,
+            "window_start": window_start.isoformat(timespec="seconds"),
             "until": until.isoformat(timespec="seconds"),
             "sample_seats": len(rows),
             "rows": show,
@@ -1941,7 +2005,7 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
     if getattr(args, "csv", False):
         import csv as _csv
         writer = _csv.writer(sys.stdout)
-        writer.writerow(["seat_no", "seat_id", "use_rate", "in_use_h", "free_h", "leave_h", "total_h"])
+        writer.writerow(["seat_no", "seat_id", "use_rate", "in_use_h", "free_h", "leave_h", "reserved_h", "total_h"])
         for r in show:
             writer.writerow([
                 r["seat_no"],
@@ -1950,13 +2014,14 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
                 f"{r['in_use_h']:.4f}",
                 f"{r['free_h']:.4f}",
                 f"{r['leave_h']:.4f}",
+                f"{r['reserved_h']:.4f}",
                 f"{r['total_h']:.4f}",
             ])
         return 0
 
     ui.section(
         f"座位使用率 · 样本 {len(rows)} 个座位 · 区间 "
-        f"{(since.isoformat(timespec='seconds') if since else '全部')} → {until.isoformat(timespec='seconds')}"
+        f"{window_start.isoformat(timespec='seconds')} → {until.isoformat(timespec='seconds')}"
     )
     table = [
         [
@@ -1965,14 +2030,15 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
             f"{r['in_use_h']:.2f}",
             f"{r['free_h']:.2f}",
             f"{r['leave_h']:.2f}",
+            f"{r['reserved_h']:.2f}",
             f"{r['total_h']:.2f}",
         ]
         for r in show
     ]
     ui.table(
-        ["座位", "使用率", "使用(h)", "空闲(h)", "暂离(h)", "总时(h)"],
+        ["座位", "使用率", "使用(h)", "空闲(h)", "暂离(h)", "预约(h)", "总时(h)"],
         table,
-        aligns=["right", "right", "right", "right", "right", "right"],
+        aligns=["right", "right", "right", "right", "right", "right", "right"],
     )
     if top > 0 and len(rows) > top:
         ui.tip(f"仅显示前 {top} 条（共 {len(rows)}），加 --top 0 查看全部")
