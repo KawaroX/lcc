@@ -43,6 +43,14 @@ def events_file() -> Path:
     return DATA_DIR / "watch_events.jsonl"
 
 
+def sessions_file() -> Path:
+    return DATA_DIR / "watch_sessions.jsonl"
+
+
+def last_tick_file() -> Path:
+    return DATA_DIR / "watch_last_tick.txt"
+
+
 def log_file() -> Path:
     return DATA_DIR / "watch.log"
 
@@ -406,6 +414,139 @@ def dispatch_notifications(
 # --------------------------------------------------------------------------- #
 # 给 seats 命令用的回看接口
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# 会话（session）：守护进程的开机/关机窗口
+# --------------------------------------------------------------------------- #
+
+
+def _append_session_entry(kind: str, ts: _dt.datetime) -> None:
+    ensure_data_dir()
+    with sessions_file().open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": ts.isoformat(timespec="seconds"), "kind": kind}) + "\n")
+
+
+def update_last_tick(ts: _dt.datetime) -> None:
+    """每个 tick 覆写 last_tick 文件，作为崩溃恢复用的心跳。"""
+    ensure_data_dir()
+    tmp = last_tick_file().with_suffix(".txt.tmp")
+    tmp.write_text(ts.isoformat(timespec="seconds"), encoding="utf-8")
+    os.replace(tmp, last_tick_file())
+
+
+def _read_last_tick() -> _dt.datetime | None:
+    p = last_tick_file()
+    if not p.exists():
+        return None
+    try:
+        s = p.read_text(encoding="utf-8").strip()
+        return _dt.datetime.fromisoformat(s)
+    except (OSError, ValueError):
+        return None
+
+
+def _clear_last_tick() -> None:
+    p = last_tick_file()
+    if p.exists():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def recover_crashed_session() -> _dt.datetime | None:
+    """若 last_tick 文件还在（上次没跑 stop 钩子），补一条 stop 入会话日志。
+
+    返回补写的 stop 时间戳，没补就返回 None。
+    """
+    last = _read_last_tick()
+    if last is None:
+        return None
+    _append_session_entry("stop", last)
+    _clear_last_tick()
+    return last
+
+
+def record_session_start(ts: _dt.datetime) -> None:
+    _append_session_entry("start", ts)
+
+
+def record_session_stop(ts: _dt.datetime) -> None:
+    _append_session_entry("stop", ts)
+    _clear_last_tick()
+
+
+def load_sessions(*, until: _dt.datetime) -> list[tuple[_dt.datetime, _dt.datetime]]:
+    """读 sessions jsonl，组装成 [(start, end), ...]。
+
+    - 配对 start ↔ 紧随其后的 stop
+    - 没 stop 的孤立 start（当前正在跑的会话）→ end = last_tick 或 until
+    - 多个连续 start（崩溃后未恢复就再次手动启动）→ 前一个 start 的 end 用 last_tick
+      若 last_tick 也没了，前一个 start 视为长度 0 段（不计入）
+    - 文件不存在或没数据 → 返回空列表
+    """
+    p = sessions_file()
+    if not p.exists():
+        return []
+
+    entries: list[tuple[_dt.datetime, str]] = []
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                ts = _dt.datetime.fromisoformat(obj.get("ts") or "")
+                kind = str(obj.get("kind") or "")
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if kind in ("start", "stop"):
+                entries.append((ts, kind))
+
+    sessions: list[tuple[_dt.datetime, _dt.datetime]] = []
+    open_start: _dt.datetime | None = None
+    for ts, kind in entries:
+        if kind == "start":
+            if open_start is not None:
+                # 上一段没显式 stop（崩溃 + 手动 start）。
+                # 用 last_tick 当结束；没的话丢掉这段。
+                last_tick = _read_last_tick()
+                if last_tick and last_tick > open_start:
+                    sessions.append((open_start, last_tick))
+            open_start = ts
+        elif kind == "stop":
+            if open_start is not None and ts > open_start:
+                sessions.append((open_start, ts))
+                open_start = None
+            # 孤立的 stop（极端情况）：忽略
+
+    if open_start is not None:
+        # 当前正在跑的会话，end 取 last_tick；没的话用 until
+        last_tick = _read_last_tick() or until
+        end = min(last_tick, until)
+        if end > open_start:
+            sessions.append((open_start, end))
+
+    return sessions
+
+
+def clip_duration_to_sessions(
+    start: _dt.datetime,
+    end: _dt.datetime,
+    sessions: list[tuple[_dt.datetime, _dt.datetime]],
+) -> float:
+    """把 [start, end] 与 sessions 列表求交集，返回总秒数。"""
+    if end <= start or not sessions:
+        return 0.0
+    total = 0.0
+    for s, e in sessions:
+        lo = max(start, s)
+        hi = min(end, e)
+        if hi > lo:
+            total += (hi - lo).total_seconds()
+    return total
 
 
 def spawn_daemon(

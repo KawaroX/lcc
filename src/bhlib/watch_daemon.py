@@ -119,6 +119,15 @@ def main(args: argparse.Namespace | None = None) -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # 崩溃恢复：上次没跑 stop 钩子的话，补一条 stop 进会话日志
+    recovered = watch.recover_crashed_session()
+    if recovered is not None:
+        log_line(f"INFO 检测到崩溃残留，已补写 stop@{recovered.isoformat(timespec='seconds')}")
+
+    boot_ts = _dt.datetime.now()
+    watch.record_session_start(boot_ts)
+    watch.update_last_tick(boot_ts)
+
     log_line(
         f"INFO watch daemon 启动 area={args.area_id} poll={args.poll_seconds}s "
         f"pid={__import__('os').getpid()}"
@@ -132,6 +141,8 @@ def main(args: argparse.Namespace | None = None) -> int:
                 insecure=bool(args.insecure),
                 use_proxy=bool(args.proxy),
             )
+            # 心跳：tick 走完一轮就更新一次
+            watch.update_last_tick(_dt.datetime.now())
             if n_ev or n_notify:
                 log_line(f"INFO tick events={n_ev} notify={n_notify}")
         except Exception as e:  # noqa: BLE001
@@ -145,7 +156,10 @@ def main(args: argparse.Namespace | None = None) -> int:
             time.sleep(step)
             slept += step
 
-    log_line("INFO watch daemon 退出")
+    # 收尾：用最后心跳的时间作为 stop ts（精确到最后一次 tick）
+    stop_ts = watch._read_last_tick() or _dt.datetime.now()
+    watch.record_session_stop(stop_ts)
+    log_line(f"INFO watch daemon 退出，session stop@{stop_ts.isoformat(timespec='seconds')}")
     return 0
 
 

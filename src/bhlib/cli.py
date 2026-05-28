@@ -1799,6 +1799,10 @@ def _cmd_watch_status(args: argparse.Namespace) -> int:
     ev_path = watch.events_file()
     if ev_path.exists():
         ui.kv("事件文件", f"{ev_path} ({ev_path.stat().st_size} B)", key_width=10)
+    sessions = watch.load_sessions(until=_dt.datetime.now())
+    if sessions:
+        total = sum((e - s).total_seconds() for s, e in sessions) / 3600
+        ui.kv("会话段数", f"{len(sessions)} 段 · 累计观测 {total:.2f}h", key_width=10)
     if not alive:
         ui.warn("进程已退出，bhlib watch stop 清理状态", hint=None)
     return 0
@@ -1869,36 +1873,62 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
     until = _dt.datetime.now()
     since_arg = _parse_since_to_datetime(getattr(args, "since", None))
 
-    # 把整段历史读出来；体量不大（一年也才几十万行），materialize 起来方便算
     all_events: list[dict] = list(watch.iter_events())
     state = watch.load_state() or {}
     state_seats = (state.get("seats") if isinstance(state.get("seats"), dict) else {}) or {}
+    sessions = watch.load_sessions(until=until)
 
-    # 决定窗口起点：--since 优先；否则用 watch 第一次启动的时间；再否则用最早事件
-    if since_arg is not None:
-        window_start = since_arg
-    else:
+    # 旧版（< 0.6.4）数据没有 sessions.jsonl；为不让历史数据无处安放，
+    # 合成一段从 first_seen_at（或最早事件）到最后事件的兜底会话
+    if not sessions and all_events:
+        try:
+            earliest = _dt.datetime.fromisoformat(all_events[0].get("ts") or "")
+        except ValueError:
+            earliest = None
+        try:
+            latest = _dt.datetime.fromisoformat(all_events[-1].get("ts") or "")
+        except ValueError:
+            latest = None
         fsa = state.get("first_seen_at")
-        window_start = None
         if isinstance(fsa, str):
             try:
-                window_start = _dt.datetime.fromisoformat(fsa)
+                fsa_dt = _dt.datetime.fromisoformat(fsa)
+                if earliest is None or fsa_dt < earliest:
+                    earliest = fsa_dt
             except ValueError:
-                window_start = None
-        if window_start is None and all_events:
-            try:
-                window_start = _dt.datetime.fromisoformat(all_events[0].get("ts") or "")
-            except ValueError:
-                window_start = None
+                pass
+        if earliest is not None and latest is not None and latest > earliest:
+            sessions = [(earliest, latest)]
 
-    if window_start is None:
-        ui.tip("没有可分析的数据（先让 watch 跑一段时间）")
+    # 应用 --since（截断每段会话）
+    if since_arg is not None:
+        sessions = [
+            (max(s, since_arg), e)
+            for s, e in sessions
+            if e > since_arg
+        ]
+
+    if not sessions:
+        ui.tip("没有可分析的会话窗口（先 bhlib watch start，让它跑一段时间）")
         return 0
 
-    # current[sid] = (status, since_ts)；accum[sid][status] = 秒
+    window_start = sessions[0][0]
+    window_end = sessions[-1][1]
+    total_observed_s = sum((e - s).total_seconds() for s, e in sessions)
+
+    # 用 sessions 裁剪每段状态时长。current[sid] = (status, since_ts)
     current: dict[str, tuple[str, _dt.datetime]] = {}
     accum: dict[str, dict[str, float]] = {}
     seat_no: dict[str, str] = {}
+
+    def _accrue(sid: str, st: str, start: _dt.datetime, end: _dt.datetime) -> None:
+        if not st or end <= start:
+            return
+        secs = watch.clip_duration_to_sessions(start, end, sessions)
+        if secs <= 0:
+            return
+        accum.setdefault(sid, {}).setdefault(st, 0.0)
+        accum[sid][st] += secs
 
     for ev in all_events:
         try:
@@ -1912,42 +1942,23 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
             seat_no[sid] = str(ev["seat_no"])
         to_st = str(ev.get("to") or "")
 
-        if ts < window_start:
-            # 窗口前的事件：只用来"知道窗口起点时这个座位的状态"，不累加时长
-            current[sid] = (to_st, window_start)
-            continue
-
         if sid not in current:
-            # 窗口内的第一个事件，且窗口前没见过它
-            # → 用事件自带的 from 字段还原"窗口起点到此刻"的状态
+            # 首次见到这个座位：用 ev.from 还原"window_start → ts"段的状态
             from_st = str(ev.get("from") or "")
             if from_st:
-                delta = (ts - window_start).total_seconds()
-                if delta > 0:
-                    accum.setdefault(sid, {}).setdefault(from_st, 0.0)
-                    accum[sid][from_st] += delta
+                _accrue(sid, from_st, window_start, ts)
             current[sid] = (to_st, ts)
             continue
 
-        # 常规累加：上一状态从 prev_ts 持续到现在
         prev_st, prev_ts = current[sid]
-        delta = (ts - prev_ts).total_seconds()
-        if delta > 0:
-            accum.setdefault(sid, {}).setdefault(prev_st, 0.0)
-            accum[sid][prev_st] += delta
+        _accrue(sid, prev_st, prev_ts, ts)
         current[sid] = (to_st, ts)
 
-    # 收尾：把最后一段 (最后事件 → until) 累加
+    # 每个座位最后那段：从最后事件到 window_end
     for sid, (st, ts) in current.items():
-        if not st:
-            continue
-        delta = (until - ts).total_seconds()
-        if delta > 0:
-            accum.setdefault(sid, {}).setdefault(st, 0.0)
-            accum[sid][st] += delta
+        _accrue(sid, st, ts, window_end)
 
-    # 整段窗口里没出现过事件的座位：用 state 的当前状态填满整段
-    full_window = (until - window_start).total_seconds()
+    # 整段窗口内完全没事件的座位：用 state 当前状态填满 sessions
     for sid, sd in state_seats.items():
         if sid in accum:
             continue
@@ -1958,9 +1969,7 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
             continue
         if sd.get("no"):
             seat_no[sid] = str(sd["no"])
-        if full_window > 0:
-            accum.setdefault(sid, {}).setdefault(str(st), 0.0)
-            accum[sid][str(st)] += full_window
+        _accrue(sid, str(st), window_start, window_end)
 
     if not accum:
         ui.tip("没有可分析的数据（先让 watch 跑一段时间）")
@@ -1990,11 +1999,20 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
     top = int(getattr(args, "top", 10))
     show = rows if top <= 0 else rows[:top]
 
-    # JSON 导出（包含 since/until 元信息，方便回查时间窗）
+    # JSON 导出（包含 sessions/until 元信息，方便回查时间窗）
     if getattr(args, "json", False):
         payload = {
             "window_start": window_start.isoformat(timespec="seconds"),
+            "window_end": window_end.isoformat(timespec="seconds"),
             "until": until.isoformat(timespec="seconds"),
+            "sessions": [
+                {
+                    "start": s.isoformat(timespec="seconds"),
+                    "end": e.isoformat(timespec="seconds"),
+                }
+                for s, e in sessions
+            ],
+            "total_observed_h": total_observed_s / 3600,
             "sample_seats": len(rows),
             "rows": show,
         }
@@ -2020,9 +2038,13 @@ def _cmd_watch_stats(args: argparse.Namespace) -> int:
         return 0
 
     ui.section(
-        f"座位使用率 · 样本 {len(rows)} 个座位 · 区间 "
-        f"{window_start.isoformat(timespec='seconds')} → {until.isoformat(timespec='seconds')}"
+        f"座位使用率 · 样本 {len(rows)} 个座位 · "
+        f"会话 {len(sessions)} 段 · 累计观测 {total_observed_s / 3600:.2f}h"
     )
+    print(ui.dim(
+        f"  窗口：{window_start.isoformat(timespec='seconds')} → "
+        f"{window_end.isoformat(timespec='seconds')}"
+    ))
     table = [
         [
             r["seat_no"],
@@ -2186,9 +2208,13 @@ def _cmd_watch_reset(args: argparse.Namespace) -> int:
     if target_state and watch.state_file().exists():
         watch.state_file().unlink()
         ui.ok(f"已删除 {watch.state_file()}")
-    if target_events and watch.events_file().exists():
-        watch.events_file().unlink()
-        ui.ok(f"已删除 {watch.events_file()}")
+    if target_events:
+        if watch.events_file().exists():
+            watch.events_file().unlink()
+            ui.ok(f"已删除 {watch.events_file()}")
+        if watch.sessions_file().exists():
+            watch.sessions_file().unlink()
+            ui.ok(f"已删除 {watch.sessions_file()}")
     return 0
 
 
